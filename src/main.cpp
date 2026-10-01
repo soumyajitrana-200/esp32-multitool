@@ -271,23 +271,54 @@ void setup() {
     initSineTable();
     Serial.println("[+] Sine table ready");
 
-    esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-    Serial.println("[+] BLE memory released");
+    esp_bt_controller_status_t status = esp_bt_controller_get_status();
+    Serial.printf("[*] BT ctrl status BEFORE: %d\n", status);
 
-    WiFi.mode(WIFI_OFF);
-    Serial.println("[+] WiFi off");
+    if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        Serial.println("[*] Disabling existing BT controller...");
+        esp_bt_controller_disable();
+        status = esp_bt_controller_get_status();
+        Serial.printf("[*] After disable: %d\n", status);
+    }
+    if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
+        Serial.println("[*] Deinitializing BT controller...");
+        esp_bt_controller_deinit();
+        status = esp_bt_controller_get_status();
+        Serial.printf("[*] After deinit: %d\n", status);
+    }
 
-    esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
-    if (esp_bt_controller_init(&bt_cfg) != ESP_OK) {
-        Serial.println("[!] BT ctrl init fail"); return;
+    if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
+        Serial.println("[*] Releasing BLE memory...");
+        esp_err_t mem_err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
+        Serial.printf("[*] mem_release: %d\n", mem_err);
+
+        Serial.println("[*] Initializing BT controller...");
+        esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
+        esp_err_t err = esp_bt_controller_init(&bt_cfg);
+        Serial.printf("[*] bt_ctrl_init: %d (%s)\n", err, esp_err_to_name(err));
+        if (err != ESP_OK) {
+            Serial.println("[!] BT ctrl init FAILED");
+            return;
+        }
+
+        err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+        Serial.printf("[*] bt_ctrl_enable: %d (%s)\n", err, esp_err_to_name(err));
+        if (err != ESP_OK) {
+            Serial.println("[!] BT ctrl enable FAILED");
+            return;
+        }
     }
-    if (esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT) != ESP_OK) {
-        Serial.println("[!] BT ctrl enable fail"); return;
-    }
+
     Serial.println("[+] BT controller ready");
 
-    esp_bluedroid_init();
-    esp_bluedroid_enable();
+    esp_err_t e = esp_bluedroid_init();
+    Serial.printf("[*] bluedroid_init: %d\n", e);
+    if (e != ESP_OK) return;
+
+    e = esp_bluedroid_enable();
+    Serial.printf("[*] bluedroid_enable: %d\n", e);
+    if (e != ESP_OK) return;
+
     Serial.println("[+] Bluedroid ready");
 
     esp_bt_dev_set_device_name("SOUMYA-Audio");
@@ -298,11 +329,14 @@ void setup() {
     esp_a2d_register_callback(a2d_cb);
     esp_a2d_source_register_data_callback(a2d_data_cb);
     esp_a2d_source_init();
-    Serial.println("[+] A2DP source init");
+    Serial.println("[+] A2DP init");
 
     esp_avrc_ct_register_callback(avrc_cb);
     esp_avrc_ct_init();
     Serial.println("[+] AVRCP init");
+
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[+] WiFi off");
 
     Serial.println("\n=== Ready ===");
     printHelp();
