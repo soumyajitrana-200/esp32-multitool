@@ -1,14 +1,13 @@
 // ============================================================
-//  SOUMYA — BT Audio Test (Raw ESP-IDF on Core 2.0.17)
-//  TWS scan → connect → melody + AVRCP gesture
+//  SOUMYA BT Audio v5 — COMPLETE (works + TG gesture)
 // ============================================================
 
-#include <Arduino.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <WiFi.h>
 #include <math.h>
+#include "esp32-hal-bt.h"
 
 extern "C" {
 #include "esp_bt.h"
@@ -27,14 +26,12 @@ extern "C" {
 
 Adafruit_SSD1306 display(SCR_W, SCR_H, &Wire, -1);
 
-// ─── Sine table ───
 int16_t sineTable[256];
 void initSineTable() {
     for (int i = 0; i < 256; i++)
         sineTable[i] = (int16_t)(sinf(i * 2.0f * PI / 256.0f) * 28000);
 }
 
-// ─── Melody ───
 const float MELODY[] = {440.0f, 523.25f, 659.25f, 783.99f, 1046.5f};
 const int MELODY_LEN = 5;
 const unsigned long NOTE_DUR_MS = 350;
@@ -49,15 +46,14 @@ volatile uint32_t cbFrames = 0;
 unsigned long lastReport = 0;
 unsigned long connectTimeMs = 0;
 
-// ─── Devices ───
 struct BtDevice { uint8_t mac[6]; char name[32]; };
 #define MAX_DEVICES 20
 BtDevice btDevices[MAX_DEVICES];
 int btDeviceCount = 0;
-
 bool a2dConn = false;
+volatile bool requestStartStream = false;
+volatile bool streamStarted = false;
 
-// ─── OLED ───
 void oledMsg(const char* l1, const char* l2) {
     display.clearDisplay();
     display.setTextSize(1);
@@ -74,17 +70,11 @@ void oledMsg(const char* l1, const char* l2) {
     display.display();
 }
 
-// ═══════════════════════════════════════════════════════════
-//  A2DP DATA CALLBACK
-// ═══════════════════════════════════════════════════════════
+// ═══ Audio callback ═══
 int32_t a2d_data_cb(uint8_t *buf, int32_t len) {
     cbCalls++;
     cbFrames += (len / 4);
-
-    if (!isPlaying) {
-        memset(buf, 0, len);
-        return len;
-    }
+    if (!isPlaying) { memset(buf, 0, len); return len; }
 
     unsigned long now = millis();
     if (now - noteStartMs > NOTE_DUR_MS) {
@@ -92,24 +82,20 @@ int32_t a2d_data_cb(uint8_t *buf, int32_t len) {
         noteIndex = (noteIndex + 1) % MELODY_LEN;
         currentFreq = MELODY[noteIndex];
     }
-
     uint32_t phaseInc = (uint32_t)(currentFreq / 44100.0f * 65536.0f);
-
     int16_t *samples = (int16_t*)buf;
     int numI16 = len / 2;
     for (int i = 0; i < numI16; i += 2) {
         phaseAcc += phaseInc;
         uint8_t idx = (phaseAcc >> 8) & 0xFF;
         int16_t s = sineTable[idx];
-        samples[i]   = s;
+        samples[i] = s;
         samples[i+1] = s;
     }
     return len;
 }
 
-// ═══════════════════════════════════════════════════════════
-//  A2DP CALLBACK
-// ═══════════════════════════════════════════════════════════
+// ═══ A2DP callback ═══
 void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
     switch (event) {
         case ESP_A2D_CONNECTION_STATE_EVT: {
@@ -118,9 +104,12 @@ void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
                 a2dConn = true;
                 connectTimeMs = millis();
                 Serial.println("\n[A2DP] CONNECTED");
-                oledMsg("A2DP Connected", "Wait stream...");
+                oledMsg("A2DP Connected", "Start stream...");
+                requestStartStream = true;    // ← KEY: trigger start
             } else if (st == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
                 a2dConn = false;
+                streamStarted = false;
+                requestStartStream = false;
                 Serial.println("[A2DP] Disconnected");
                 oledMsg("Disconnected", "");
             } else if (st == ESP_A2D_CONNECTION_STATE_CONNECTING) {
@@ -131,93 +120,64 @@ void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
         case ESP_A2D_AUDIO_STATE_EVT: {
             esp_a2d_audio_state_t st = param->audio_stat.state;
             if (st == ESP_A2D_AUDIO_STATE_STARTED) {
-                Serial.println("[A2DP] AUDIO STREAM STARTED");
+                streamStarted = true;
+                Serial.println("[A2DP] ★ AUDIO STREAM STARTED ★");
                 oledMsg("STREAMING", "Playing tone");
             } else if (st == ESP_A2D_AUDIO_STATE_STOPPED) {
+                streamStarted = false;
                 Serial.println("[A2DP] Audio stopped");
             } else if (st == ESP_A2D_AUDIO_STATE_REMOTE_SUSPEND) {
-                Serial.println("[A2DP] Audio suspended by remote");
+                streamStarted = false;
+                Serial.println("[A2DP] Suspended by remote");
             }
             break;
         }
         case ESP_A2D_AUDIO_CFG_EVT:
             Serial.println("[A2DP] Codec configured");
+            requestStartStream = true;       // ← also trigger here
             break;
-        case ESP_A2D_PROF_STATE_EVT:
-            Serial.printf("[A2DP] Prof state: %d\n", param->a2d_prof_stat.init_state);
+        case ESP_A2D_MEDIA_CTRL_ACK_EVT:
+            Serial.printf("[A2DP] Media ack: cmd=%d\n",
+                          param->media_ctrl_stat.cmd);
             break;
         default: break;
     }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  AVRCP CALLBACK
-// ═══════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════
-//  AVRCP TG CALLBACK — TWS gesture reception
-// ═══════════════════════════════════════════════════════════
+// ═══ AVRCP CT callback ═══
+void avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param) {
+    switch (event) {
+        case ESP_AVRC_CT_CONNECTION_STATE_EVT:
+            Serial.printf("[AVRCP-CT] %s\n",
+                param->conn_stat.connected ? "connected" : "disconnected");
+            break;
+        case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
+            Serial.printf("[TWS] event=%d\n", param->change_ntf.event_id);
+            break;
+        default: break;
+    }
+}
+
+// ═══ AVRCP TG callback (gesture) ═══
 void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param) {
     switch (event) {
         case ESP_AVRC_TG_CONNECTION_STATE_EVT:
             Serial.printf("[AVRCP-TG] %s\n",
                 param->conn_stat.connected ? "connected" : "disconnected");
             break;
-        case ESP_AVRC_TG_REMOTE_FEATURES_EVT:
-            Serial.println("[AVRCP-TG] Remote features received");
-            break;
         case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
             Serial.printf("[TWS TAP] key=0x%02X state=0x%02X\n",
                 param->psth_cmd.key_code,
                 param->psth_cmd.key_state);
-            if (param->psth_cmd.key_state == 0x00) {   // PRESSED
-                switch (param->psth_cmd.key_code) {
-                    case 0x44: Serial.println("  -> PLAY"); isPlaying = true; break;
-                    case 0x46: Serial.println("  -> PAUSE"); isPlaying = false; break;
-                    case 0x45: Serial.println("  -> STOP"); isPlaying = false; break;
-                    case 0x4B: Serial.println("  -> NEXT"); break;
-                    case 0x4C: Serial.println("  -> PREV"); break;
-                    case 0x41: Serial.println("  -> VOL+"); break;
-                    case 0x42: Serial.println("  -> VOL-"); break;
-                    case 0x48: Serial.println("  -> FFWD"); break;
-                    case 0x49: Serial.println("  -> REWIND"); break;
-                }
-            }
             break;
         case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
-            Serial.printf("[TWS VOL] absolute vol=%d\n",
-                param->set_abs_vol.volume);
-            break;
-        default:
-            Serial.printf("[AVRCP-TG] event=%d\n", event);
-            break;
-    }
-}
-
-void avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param) {
-    switch (event) {
-        case ESP_AVRC_CT_CONNECTION_STATE_EVT:
-            Serial.printf("[AVRCP] %s\n",
-                param->conn_stat.connected ? "connected" : "disconnected");
-            break;
-        case ESP_AVRC_CT_REMOTE_FEATURES_EVT:
-            Serial.printf("[AVRCP] features 0x%lx\n",
-                (unsigned long)param->rmt_feats.feat_mask);
-            break;
-        case ESP_AVRC_CT_CHANGE_NOTIFY_EVT:
-            Serial.printf("[TWS GESTURE] event_id=%d\n", param->change_ntf.event_id);
-            if (param->change_ntf.event_id == ESP_AVRC_RN_PLAY_STATUS_CHANGE) {
-                uint8_t st = param->change_ntf.event_parameter.playback;
-                if (st == 1) { isPlaying = true; Serial.println("[TWS] PLAY"); }
-                else if (st == 2) { isPlaying = false; Serial.println("[TWS] PAUSE"); }
-            }
+            Serial.printf("[TWS VOL] %d\n", param->set_abs_vol.volume);
             break;
         default: break;
     }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  GAP CALLBACK
-// ═══════════════════════════════════════════════════════════
+// ═══ GAP callback ═══
 void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     switch (event) {
         case ESP_BT_GAP_DISC_RES_EVT: {
@@ -234,7 +194,6 @@ void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
             for (int i = 0; i < btDeviceCount; i++)
                 if (memcmp(btDevices[i].mac, bda, 6) == 0) return;
             if (btDeviceCount >= MAX_DEVICES) return;
-
             memcpy(btDevices[btDeviceCount].mac, bda, 6);
             strncpy(btDevices[btDeviceCount].name, name, 31);
             btDevices[btDeviceCount].name[31] = 0;
@@ -261,14 +220,12 @@ void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  Commands
-// ═══════════════════════════════════════════════════════════
 void printHelp() {
     Serial.println("\n── Commands ──");
     Serial.println("  scan          - Scan BT");
     Serial.println("  connect N     - Connect N");
-    Serial.println("  play / pause  - Tone control");
+    Serial.println("  start         - Force stream start");
+    Serial.println("  play / pause  - Tone");
     Serial.println("  status        - State");
     Serial.println("  help          - Menu\n");
 }
@@ -293,19 +250,17 @@ void connectTo(int idx) {
     esp_a2d_source_connect(d->mac);
 }
 
-// ═══════════════════════════════════════════════════════════
-//  Setup
-// ═══════════════════════════════════════════════════════════
+// ═══ Setup ═══
 void setup() {
     Serial.begin(115200);
     delay(800);
-    Serial.println("\n=== SOUMYA BT Audio v4 ===\n");
+    Serial.println("\n=== SOUMYA BT Audio v5 ===\n");
 
     Wire.begin(OLED_SDA, OLED_SCL);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         Serial.println("[!] OLED FAIL");
     } else {
-        oledMsg("BT Audio v4", "Init...");
+        oledMsg("BT Audio v5", "Init...");
     }
 
     initSineTable();
@@ -315,17 +270,12 @@ void setup() {
     if (!btStart()) {
         Serial.println("[!] btStart failed — retry");
         delay(500);
-        if (!btStart()) {
-            Serial.println("[!] Failed twice — abort");
-            return;
-        }
+        if (!btStart()) { Serial.println("[!] Abort"); return; }
     }
     delay(200);
-    Serial.printf("[+] btStart OK — status: %d\n",
-        esp_bt_controller_get_status());
+    Serial.printf("[+] btStart OK — status: %d\n", esp_bt_controller_get_status());
 
     esp_bluedroid_status_t bd = esp_bluedroid_get_status();
-    Serial.printf("[*] Bluedroid: %d\n", bd);
     if (bd == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
         Serial.printf("[*] bd_init: %d\n", esp_bluedroid_init());
         Serial.printf("[*] bd_enable: %d\n", esp_bluedroid_enable());
@@ -363,10 +313,39 @@ void setup() {
     startScan();
 }
 
-// ═══════════════════════════════════════════════════════════
-//  Loop
-// ═══════════════════════════════════════════════════════════
+// ═══ Loop ═══
 void loop() {
+    // ═══ Handle stream start request ═══
+    if (requestStartStream && a2dConn) {
+        requestStartStream = false;
+        delay(400);
+        esp_err_t err = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+        Serial.printf("[A2DP] Media START: %d (%s)\n",
+                      err, esp_err_to_name(err));
+        delay(100);
+        esp_avrc_ct_send_passthrough_cmd(0,
+            ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_PRESSED);
+        delay(30);
+        esp_avrc_ct_send_passthrough_cmd(0,
+            ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_RELEASED);
+        Serial.println("[AVRCP] PLAY sent");
+    }
+
+    // ═══ Retry if stream didn't start ═══
+    static unsigned long lastRetry = 0;
+    if (a2dConn && !streamStarted && millis() - connectTimeMs > 5000) {
+        if (millis() - lastRetry > 5000) {
+            lastRetry = millis();
+            Serial.println("[A2DP] Retry stream...");
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+            esp_avrc_ct_send_passthrough_cmd(0,
+                ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_PRESSED);
+            delay(30);
+            esp_avrc_ct_send_passthrough_cmd(0,
+                ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_RELEASED);
+        }
+    }
+
     if (Serial.available()) {
         String cmd = Serial.readStringUntil('\n');
         cmd.trim(); cmd.toLowerCase();
@@ -376,13 +355,22 @@ void loop() {
         else if (cmd == "scan") startScan();
         else if (cmd.startsWith("connect ")) connectTo(cmd.substring(8).toInt());
         else if (cmd.startsWith("c ")) connectTo(cmd.substring(2).toInt());
+        else if (cmd == "start") {
+            Serial.println("[*] Force stream start...");
+            esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+            esp_avrc_ct_send_passthrough_cmd(0,
+                ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_PRESSED);
+            delay(30);
+            esp_avrc_ct_send_passthrough_cmd(0,
+                ESP_AVRC_PT_CMD_PLAY, ESP_AVRC_PT_CMD_STATE_RELEASED);
+        }
         else if (cmd == "play") { isPlaying = true; Serial.println("[*] PLAY"); }
         else if (cmd == "pause") { isPlaying = false; Serial.println("[*] PAUSE"); }
         else if (cmd == "status") {
             Serial.println("\n=== STATUS ===");
-            Serial.printf("A2DP: %s\n", a2dConn ? "CONNECTED" : "no");
-            Serial.printf("CB calls: %u\n", cbCalls);
-            Serial.printf("Frames: %u\n", cbFrames);
+            Serial.printf("A2DP: %s\n", a2dConn ? "YES" : "no");
+            Serial.printf("Stream: %s\n", streamStarted ? "STARTED" : "no");
+            Serial.printf("CB: %u  Frames: %u\n", cbCalls, cbFrames);
             Serial.printf("Heap: %u\n\n", ESP.getFreeHeap());
         }
         else Serial.printf("[!] Unknown: %s\n", cmd.c_str());
@@ -392,12 +380,13 @@ void loop() {
     if (now - lastReport >= 3000) {
         lastReport = now;
         if (a2dConn) {
-            Serial.printf("[♪] cb=%u frames=%u freq=%.0fHz heap=%u\n",
-                cbCalls, cbFrames, currentFreq, ESP.getFreeHeap());
+            Serial.printf("[♪] cb=%u frames=%u freq=%.0fHz stream=%s\n",
+                cbCalls, cbFrames, currentFreq,
+                streamStarted ? "YES" : "no");
             if (cbCalls == 0) {
                 unsigned long since = (now - connectTimeMs) / 1000;
-                if (since == 6) Serial.println("[!] No audio callback");
-                if (since == 12) Serial.println("[!] TWS refusing stream");
+                if (since == 8) Serial.println("[!] Auto retry...");
+                if (since == 15) Serial.println("[!] TWS refuses stream");
             } else {
                 char buf[24];
                 snprintf(buf, sizeof(buf), "%.0fHz cb%u", currentFreq, cbCalls);
