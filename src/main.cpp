@@ -259,7 +259,7 @@ void connectTo(int idx) {
 void setup() {
     Serial.begin(115200);
     delay(800);
-    Serial.println("\n=== SOUMYA BT Audio Test ===\n");
+    Serial.println("\n=== SOUMYA BT Audio Test v2 ===\n");
 
     Wire.begin(OLED_SDA, OLED_SCL);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
@@ -271,75 +271,88 @@ void setup() {
     initSineTable();
     Serial.println("[+] Sine table ready");
 
+    // ─── Step 1: BT controller ───
     esp_bt_controller_status_t status = esp_bt_controller_get_status();
-    Serial.printf("[*] BT ctrl status BEFORE: %d\n", status);
-
-    if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
-        Serial.println("[*] Disabling existing BT controller...");
-        esp_bt_controller_disable();
-        status = esp_bt_controller_get_status();
-        Serial.printf("[*] After disable: %d\n", status);
-    }
-    if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
-        Serial.println("[*] Deinitializing BT controller...");
-        esp_bt_controller_deinit();
-        status = esp_bt_controller_get_status();
-        Serial.printf("[*] After deinit: %d\n", status);
-    }
+    Serial.printf("[*] BT status BEFORE: %d\n", status);
 
     if (status == ESP_BT_CONTROLLER_STATUS_IDLE) {
-        Serial.println("[*] Releasing BLE memory...");
-        esp_err_t mem_err = esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-        Serial.printf("[*] mem_release: %d\n", mem_err);
-
-        Serial.println("[*] Initializing BT controller...");
+        Serial.println("[*] Controller IDLE → init");
         esp_bt_controller_config_t bt_cfg = BT_CONTROLLER_INIT_CONFIG_DEFAULT();
         esp_err_t err = esp_bt_controller_init(&bt_cfg);
         Serial.printf("[*] bt_ctrl_init: %d (%s)\n", err, esp_err_to_name(err));
-        if (err != ESP_OK) {
-            Serial.println("[!] BT ctrl init FAILED");
-            return;
+        if (err == ESP_OK) {
+            err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+            Serial.printf("[*] bt_ctrl_enable: %d (%s)\n", err, esp_err_to_name(err));
+            if (err != ESP_OK) {
+                Serial.println("[!] Enable failed — trying anyway...");
+            }
+        } else if (err == ESP_ERR_INVALID_STATE) {
+            Serial.println("[*] Already inited by framework — continuing");
+        } else {
+            Serial.println("[!] Init failed — continuing anyway...");
         }
-
-        err = esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
-        Serial.printf("[*] bt_ctrl_enable: %d (%s)\n", err, esp_err_to_name(err));
-        if (err != ESP_OK) {
-            Serial.println("[!] BT ctrl enable FAILED");
-            return;
-        }
+    } else if (status == ESP_BT_CONTROLLER_STATUS_INITED) {
+        Serial.println("[*] Controller INITED → enable");
+        esp_bt_controller_enable(ESP_BT_MODE_CLASSIC_BT);
+    } else if (status == ESP_BT_CONTROLLER_STATUS_ENABLED) {
+        Serial.println("[*] Controller already ENABLED");
     }
 
-    Serial.println("[+] BT controller ready");
+    delay(100);
+    Serial.printf("[*] BT status AFTER: %d\n", esp_bt_controller_get_status());
 
-    esp_err_t e = esp_bluedroid_init();
-    Serial.printf("[*] bluedroid_init: %d\n", e);
-    if (e != ESP_OK) return;
+    // ─── Step 2: Bluedroid ───
+    Serial.println("[*] Init Bluedroid...");
+    esp_err_t bd_err = esp_bluedroid_get_status();
+    Serial.printf("[*] Bluedroid status BEFORE: %d\n", bd_err);
 
-    e = esp_bluedroid_enable();
-    Serial.printf("[*] bluedroid_enable: %d\n", e);
-    if (e != ESP_OK) return;
-
+    if (bd_err == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
+        esp_err_t e = esp_bluedroid_init();
+        Serial.printf("[*] bluedroid_init: %d (%s)\n", e, esp_err_to_name(e));
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+            Serial.println("[!] Bluedroid init failed");
+            return;
+        }
+        e = esp_bluedroid_enable();
+        Serial.printf("[*] bluedroid_enable: %d (%s)\n", e, esp_err_to_name(e));
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) {
+            Serial.println("[!] Bluedroid enable failed");
+            return;
+        }
+    } else if (bd_err == ESP_BLUEDROID_STATUS_INITIALIZED) {
+        esp_bluedroid_enable();
+    }
     Serial.println("[+] Bluedroid ready");
 
+    // ─── Step 3: Device name + discoverable ───
     esp_bt_dev_set_device_name("SOUMYA-Audio");
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
-    Serial.println("[+] Device: SOUMYA-Audio");
+    Serial.println("[+] Device: SOUMYA-Audio (discoverable)");
 
+    // ─── Step 4: Register callbacks ───
     esp_bt_gap_register_callback(gap_cb);
     esp_a2d_register_callback(a2d_cb);
     esp_a2d_source_register_data_callback(a2d_data_cb);
-    esp_a2d_source_init();
-    Serial.println("[+] A2DP init");
 
-    esp_avrc_ct_register_callback(avrc_cb);
-    esp_avrc_ct_init();
-    Serial.println("[+] AVRCP init");
+    esp_err_t a2d_err = esp_a2d_source_init();
+    Serial.printf("[*] a2d_source_init: %d (%s)\n", a2d_err, esp_err_to_name(a2d_err));
+    if (a2d_err != ESP_OK && a2d_err != ESP_ERR_INVALID_STATE) {
+        Serial.println("[!] A2DP init failed");
+        return;
+    }
+
+    esp_err_t avrc_err = esp_avrc_ct_init();
+    Serial.printf("[*] avrc_ct_init: %d (%s)\n", avrc_err, esp_err_to_name(avrc_err));
+    if (avrc_err != ESP_OK && avrc_err != ESP_ERR_INVALID_STATE) {
+        Serial.println("[!] AVRCP init failed");
+    }
 
     WiFi.mode(WIFI_OFF);
     Serial.println("[+] WiFi off");
 
     Serial.println("\n=== Ready ===");
     printHelp();
+    delay(500);
     startScan();
 }
 
