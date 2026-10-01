@@ -285,7 +285,14 @@ void setup() {
     Serial.println("[+] Bluedroid ready");
 
     esp_bt_dev_set_device_name("SOUMYA-Audio");
-    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+        // ═══ Set CoD as SMARTPHONE so TWS sends gestures ═══
+    esp_bt_cod_t cod = {};
+    cod.service = 0x4300;   // AUDIO | RENDERING | TELEPHONY
+    cod.major = 0x02;       // PHONE (major device class)
+    cod.minor = 0x04;       // SMART_PHONE
+    esp_bt_gap_set_cod(cod, ESP_BT_SET_COD_MAJOR_MINOR);
+    Serial.println("[+] CoD set to SMARTPHONE (TWS gestures enabled)");
+esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
     Serial.println("[+] Device: SOUMYA-Audio");
 
     esp_bt_gap_register_callback(gap_cb);
