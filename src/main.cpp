@@ -153,6 +153,46 @@ void a2d_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t *param) {
 // ═══════════════════════════════════════════════════════════
 //  AVRCP CALLBACK
 // ═══════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════
+//  AVRCP TG CALLBACK — TWS gesture reception
+// ═══════════════════════════════════════════════════════════
+void avrc_tg_cb(esp_avrc_tg_cb_event_t event, esp_avrc_tg_cb_param_t *param) {
+    switch (event) {
+        case ESP_AVRC_TG_CONNECTION_STATE_EVT:
+            Serial.printf("[AVRCP-TG] %s\n",
+                param->conn_stat.connected ? "connected" : "disconnected");
+            break;
+        case ESP_AVRC_TG_REMOTE_FEATURES_EVT:
+            Serial.println("[AVRCP-TG] Remote features received");
+            break;
+        case ESP_AVRC_TG_PASSTHROUGH_CMD_EVT:
+            Serial.printf("[TWS TAP] key=0x%02X state=0x%02X\n",
+                param->psth_cmd.key_code,
+                param->psth_cmd.key_state);
+            if (param->psth_cmd.key_state == 0x00) {   // PRESSED
+                switch (param->psth_cmd.key_code) {
+                    case 0x44: Serial.println("  -> PLAY"); isPlaying = true; break;
+                    case 0x46: Serial.println("  -> PAUSE"); isPlaying = false; break;
+                    case 0x45: Serial.println("  -> STOP"); isPlaying = false; break;
+                    case 0x4B: Serial.println("  -> NEXT"); break;
+                    case 0x4C: Serial.println("  -> PREV"); break;
+                    case 0x41: Serial.println("  -> VOL+"); break;
+                    case 0x42: Serial.println("  -> VOL-"); break;
+                    case 0x48: Serial.println("  -> FFWD"); break;
+                    case 0x49: Serial.println("  -> REWIND"); break;
+                }
+            }
+            break;
+        case ESP_AVRC_TG_SET_ABSOLUTE_VOLUME_CMD_EVT:
+            Serial.printf("[TWS VOL] absolute vol=%d\n",
+                param->set_abs_vol.volume);
+            break;
+        default:
+            Serial.printf("[AVRCP-TG] event=%d\n", event);
+            break;
+    }
+}
+
 void avrc_cb(esp_avrc_ct_cb_event_t event, esp_avrc_ct_cb_param_t *param) {
     switch (event) {
         case ESP_AVRC_CT_CONNECTION_STATE_EVT:
@@ -342,6 +382,14 @@ void setup() {
     }
 
     esp_err_t avrc_err = esp_avrc_ct_init();
+    esp_avrc_tg_register_callback(avrc_tg_cb);
+    esp_err_t tg_err = esp_avrc_tg_init();
+    Serial.printf("[*] avrc_tg_init: %d (%s)\n", tg_err, esp_err_to_name(tg_err));
+    Serial.println("[+] AVRCP TG ready (gesture reception)");
+    esp_avrc_rn_evt_cap_mask_t cap_mask = {};
+    cap_mask.bits = 0xFFFF;
+    esp_avrc_tg_set_rn_evt_cap(&cap_mask);
+    Serial.println("[+] AVRCP TG caps set");
     Serial.printf("[*] avrc_ct_init: %d (%s)\n", avrc_err, esp_err_to_name(avrc_err));
     if (avrc_err != ESP_OK && avrc_err != ESP_ERR_INVALID_STATE) {
         Serial.println("[!] AVRCP init failed");
