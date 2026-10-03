@@ -1,7 +1,7 @@
 // ============================================================
-//  SOUMYA Gadget v9.0 — Complete Final Firmware
-//  ESP32-WROOM-32 | Core 2.0.17 | Deauth Enabled
-//  MP3 Player + LED + Flashlight + WiFi Attacks + Web UI
+//  SOUMYA Gadget v9.0 — Final Complete (Serial Control)
+//  No buttons needed — Serial commands work
+//  Core 2.0.17 with Deauth support
 // ============================================================
 
 #include <Arduino.h>
@@ -41,27 +41,14 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return
 #define OLED_ADDR 0x3C
 #define SCR_W 128
 #define SCR_H 64
-
 #define PIN_SD_CS   5
 #define PIN_SD_SCK  18
 #define PIN_SD_MISO 19
 #define PIN_SD_MOSI 23
-
 #define PIN_LED_DATA 13
 #define LED_MAX 144
 #define PIN_STATUS_LED 12
 #define STATUS_LED_COUNT 2
-
-#define BTN_UP   14
-#define BTN_DOWN 27
-#define BTN_SEL  32
-#define BTN_BACK 33
-
-#define PIN_IR_RECV 4
-#define PIN_IR_SEND 5
-
-#define DEBOUNCE_MS 80
-#define LONGPRESS_MS 1500
 
 #define AP_SSID "ESP32-Gadget"
 #define AP_PASS "88888888"
@@ -72,12 +59,12 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return
 
 // ═══ ENUMS ═══
 enum Mode : uint8_t {
-    M_BOOT, M_MAIN, M_SONGS, M_PLAYER, M_SYNC,
-    M_BT_MENU, M_BT_SCAN, M_BT_DEV, M_BT_CONNECTING,
-    M_LED_MENU, M_LED_FX, M_LED_MUSIC, M_LED_BRIGHT, M_LED_WIFI,
-    M_FLASH_MENU, M_SETTINGS, M_SETTINGS_INFO,
+    M_BOOT, M_MAIN, M_SONGS, M_PLAYER,
+    M_BT_MENU, M_BT_SCAN,
+    M_LED_MENU, M_LED_FX, M_LED_BRIGHT, M_LED_WIFI,
+    M_FLASH_MENU, M_SETTINGS,
     M_WIFI_FILES,
-    M_HIDDEN, M_WIFI_TOOLS, M_BT_TOOLS, M_IR_MENU,
+    M_HIDDEN, M_WIFI_TOOLS,
     M_ATTACK_RUN
 };
 
@@ -85,7 +72,6 @@ enum AttackMode : uint8_t { ATK_NONE, ATK_BEACON, ATK_DEAUTH, ATK_PROBE };
 
 struct APRecord { char ssid[33]; char bssid[18]; int rssi; int channel; };
 
-// ═══ STATE ═══
 struct State {
     Mode mode = M_BOOT;
     int mainSel = 0, subSel = 0;
@@ -95,7 +81,6 @@ struct State {
     int batteryPct = 78;
     int songCount = 0, currentSong = -1;
     bool isPlaying = false;
-    bool btConnected = false;
     bool displaySleepEnabled = true;
 } g;
 
@@ -103,28 +88,22 @@ struct State {
 Adafruit_SSD1306 display(SCR_W, SCR_H, &Wire, -1);
 Adafruit_NeoPixel strip(LED_MAX, PIN_LED_DATA, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel flashStrip(STATUS_LED_COUNT, PIN_STATUS_LED, NEO_GRB + NEO_KHZ800);
-Preferences prefs;
 
 WebServer ledServer(80);
 WebServer fileServer(81);
 WebServer attackServer(8080);
 static bool webRunning = false;
 
-// Song list
 #define MAX_SONGS 64
 String songFiles[MAX_SONGS];
 int songCount = 0;
 
-// BT
 static bool a2dpStarted = false;
-static bool a2dConn = false;
 
-// Ring buffer
 static int16_t ringBuf[RING_SIZE];
 static volatile int rbHead = 0, rbTail = 0;
 static portMUX_TYPE rbMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Attack
 static volatile bool atkRun = false;
 static AttackMode atkMode = ATK_NONE;
 static TaskHandle_t atkTask = nullptr;
@@ -132,16 +111,15 @@ static char atkSSID[33], atkBSSID[18];
 static int atkChannel = 1;
 static volatile int atkPkts = 0;
 
-// WiFi scan
 static APRecord aps[30];
 static int apCount = 0;
 
-// Display sleep
 static unsigned long lastActivity = 0;
 static bool displayOff = false;
-
-// Animation
 static int animFrame = 0;
+
+// Serial command event
+static volatile int gSerialEv = -1;
 
 // ═══ RING BUFFER ═══
 static inline int rb_avail() { return (rbHead - rbTail + RING_SIZE) % RING_SIZE; }
@@ -175,7 +153,6 @@ public:
     bool stop() override { return true; }
 };
 
-// A2DP callback
 static volatile uint32_t cbCalls = 0;
 static int32_t a2d_data_cb(uint8_t* buf, int32_t len) {
     cbCalls++;
@@ -193,16 +170,6 @@ static int32_t a2d_data_cb(uint8_t* buf, int32_t len) {
 static AudioFileSource* audioSrc = nullptr;
 static AudioGeneratorMP3* audioMP3 = nullptr;
 static AudioOutRB* audioRB = nullptr;
-
-// ═══ BATTERY ═══
-static int readBattery() {
-    long s = 0;
-    for (int i = 0; i < 10; i++) s += analogRead(34);
-    float v = (s / 10.0f / 4095.0f) * 3.3f * 2.0f;
-    if (v >= 4.15f) return 100;
-    if (v <= 3.30f) return 0;
-    return (int)((v - 3.30f) / (4.15f - 3.30f) * 100);
-}
 
 // ═══ DISPLAY HELPERS ═══
 static void wakeDisplay() {
@@ -290,12 +257,6 @@ static void iWifi(int x,int y,uint16_t c){
     display.drawPixel(x+3,y+5,c); display.drawPixel(x+4,y+5,c);
     display.fillRect(x+3,y+6,2,2,c);
 }
-static void iEarbud(int x,int y,uint16_t c){
-    display.fillCircle(x+2,y+3,2,c);
-    display.fillRect(x+3,y+4,1,3,c);
-    display.fillCircle(x+6,y+3,2,c);
-    display.fillRect(x+6,y+4,1,3,c);
-}
 
 // ═══ MENU ROW HELPER ═══
 static void drawRow(const char* txt, int y, bool s, int iconType) {
@@ -337,19 +298,17 @@ static void drawMenuList(const char* items[], int count, int sel, int iconType) 
     }
 }
 
-// ═══ AUDIO PLAYBACK ═══
+// ═══ AUDIO ═══
 void loadSongs() {
     songCount = 0;
-    const char* mp = MUSIC_DIR;
-    File dir = SD.open(mp, FILE_READ);
+    File dir = SD.open(MUSIC_DIR, FILE_READ);
     if (!dir || !dir.isDirectory()) return;
     File f = dir.openNextFile();
     while (f && songCount < MAX_SONGS) {
         String n = String(f.name());
         if (!f.isDirectory()) {
             String l = n; l.toLowerCase();
-            if (l.endsWith(".mp3"))
-                songFiles[songCount++] = String(MUSIC_DIR) + "/" + n;
+            if (l.endsWith(".mp3")) songFiles[songCount++] = String(MUSIC_DIR) + "/" + n;
         }
         f = dir.openNextFile();
     }
@@ -370,10 +329,8 @@ void ensureBT() {
     esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
     if (!btStart()) { Serial.println("[!] btStart fail"); return; }
     delay(200);
-    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED)
-        esp_bluedroid_init();
-    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED)
-        esp_bluedroid_enable();
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED) esp_bluedroid_init();
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) esp_bluedroid_enable();
     esp_bt_dev_set_device_name(BT_NAME);
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
     esp_a2d_source_init();
@@ -436,7 +393,6 @@ static void flashApply() {
     uint8_t br = (uint32_t)g.flashBright * 255 / 100;
     for (int i = 0; i < STATUS_LED_COUNT; i++)
         flashStrip.setPixelColor(i, (uint32_t)c[0]*br/255, (uint32_t)c[1]*br/255, (uint32_t)c[2]*br/255);
-    flashStrip.setBrightness(g.flashBright * 255 / 100);
     flashStrip.show();
 }
 static void flashSet(bool on) { g.flashOn = on; flashApply(); }
@@ -450,7 +406,6 @@ static bool parseMac(const char* s, uint8_t* o) {
     for (int i = 0; i < 6; i++) o[i] = (uint8_t)v[i];
     return true;
 }
-
 static int buildBeacon(uint8_t* b, int bLen, const char* ssid, int ch) {
     int sl = strlen(ssid);
     if (sl > 32 || bLen < (38 + sl)) return 0;
@@ -473,7 +428,6 @@ static int buildBeacon(uint8_t* b, int bLen, const char* ssid, int ch) {
     b[i++]=0x03; b[i++]=0x01; b[i++]=(uint8_t)ch;
     return i;
 }
-
 static const char* FAKE[] = {
     "JioFiber_5G","Airtel_Xstream","TP-Link_2.4G","Netgear_Home",
     "Sharma_Home","Rahul_iPhone","Home_Sweet_Home","AndroidAP_1234",
@@ -544,7 +498,6 @@ static void attackWorker(void*) {
     atkMode = ATK_NONE;
     vTaskDelete(nullptr);
 }
-
 static void startBeacon() { if (atkRun) return; atkMode = ATK_BEACON; atkRun = true; xTaskCreatePinnedToCore(attackWorker,"atk",4096,nullptr,1,&atkTask,0); }
 static void startProbe()  { if (atkRun) return; atkMode = ATK_PROBE;  atkRun = true; xTaskCreatePinnedToCore(attackWorker,"atk",4096,nullptr,1,&atkTask,0); }
 static void startDeauth(int idx) {
@@ -556,11 +509,8 @@ static void startDeauth(int idx) {
     xTaskCreatePinnedToCore(attackWorker,"atk",8192,nullptr,1,&atkTask,0);
 }
 static void stopAttack() { if (!atkRun) return; atkRun = false; delay(400); }
-
 static void wifiScan() {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(100);
+    WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(100);
     int n = WiFi.scanNetworks(false, true);
     apCount = min(n, 30);
     for (int i = 0; i < apCount; i++) {
@@ -572,7 +522,7 @@ static void wifiScan() {
     WiFi.scanDelete();
 }
 
-// ═══ WEB HANDLERS ═══
+// ═══ WEB ═══
 static void hLedRoot() { ledServer.send_P(200, "text/html", LED_MUSIC_HTML); }
 static void hLedCmd() {
     if (ledServer.hasArg("effect")) g.curEffect = ledServer.arg("effect").toInt();
@@ -687,16 +637,12 @@ static void hAtkStatus() {
     attackServer.send(200, "application/json", j);
 }
 static void hEmergency() {
-    stopAttack();
-    stopSong();
+    stopAttack(); stopSong();
     ledServer.stop(); fileServer.stop(); attackServer.stop();
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_OFF);
-    webRunning = false;
-    g.mode = M_MAIN; g.mainSel = 0;
+    WiFi.softAPdisconnect(true); WiFi.mode(WIFI_OFF);
+    webRunning = false; g.mode = M_MAIN; g.mainSel = 0;
     attackServer.send(200, "text/plain", "OK");
 }
-
 static void startWeb() {
     if (webRunning) return;
     WiFi.mode(WIFI_AP);
@@ -725,8 +671,7 @@ static void startWeb() {
 static void stopWeb() {
     if (!webRunning) return;
     ledServer.stop(); fileServer.stop(); attackServer.stop();
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_OFF);
+    WiFi.softAPdisconnect(true); WiFi.mode(WIFI_OFF);
     webRunning = false;
 }
 
@@ -739,7 +684,7 @@ static void sBoot() {
     unsigned long now = millis();
     if (step == 0) { display.clearDisplay(); display.display(); lastMs = now; step = 1; return; }
     if (step >= 1 && step <= 6) {
-        if (now - lastMs > 180) {
+        if (now - lastMs > 200) {
             display.clearDisplay();
             display.setTextSize(2); display.setTextColor(WHITE);
             for (int i = 0; i < step; i++) { display.setCursor(22+i*15, 20); display.print(n[i]); }
@@ -842,8 +787,7 @@ static void sBtMenu() {
     display.clearDisplay(); hdr("BLUETOOTH");
     const char* it[] = {"Scan Devices","Connect Last","Forget Saved"};
     for (int i = 0; i < 3; i++) {
-        int y = 16 + i*12;
-        drawRow(it[i], y, i == g.subSel, 2);
+        drawRow(it[i], 16 + i*12, i == g.subSel, 2);
     }
     display.display();
 }
@@ -903,14 +847,10 @@ static void sLedWifi() {
     const char* t = webRunning ? "AP ACTIVE" : "AP OFF";
     int tw = strlen(t)*6;
     display.setCursor((SCR_W-tw)/2, 52); display.print(t);
-    if (webRunning) {
-        display.setCursor(4, 58);
-        display.print("192.168.4.1");
-    }
+    if (webRunning) { display.setCursor(4, 58); display.print("192.168.4.1"); }
     display.display();
 }
 
-static const char* FL_M[] = {"Power: OFF","Bright: 75%","Color: White","Effect: Solid","Done"};
 static void sFlash() {
     display.clearDisplay();
     display.drawFastHLine(0,0,SCR_W,WHITE);
@@ -971,8 +911,7 @@ static void sHidden() {
     display.fillRect(SCR_W-15, 8, 6, 2, BLACK);
     display.setTextColor(WHITE);
     for (int i = 0; i < 3; i++) {
-        int y = 18 + i*13;
-        drawRow(HID[i], y, i == g.subSel, i==0?6:i==1?2:5);
+        drawRow(HID[i], 18 + i*13, i == g.subSel, i==0?6:i==1?2:5);
     }
     display.display();
 }
@@ -1051,15 +990,15 @@ static void onSongs(int ev) {
     } else if (ev == 3) { g.mode = M_MAIN; g.mainSel = 1; }
 }
 static void onPlayer(int ev) {
-    if (ev == 0) { g.volume = min(g.volume+5, 100); }
-    else if (ev == 1) { g.volume = max(g.volume-5, 0); }
-    else if (ev == 2) { g.isPlaying = !g.isPlaying; }
+    if (ev == 0) g.volume = min(g.volume+5, 100);
+    else if (ev == 1) g.volume = max(g.volume-5, 0);
+    else if (ev == 2) g.isPlaying = !g.isPlaying;
     else if (ev == 3) { g.mode = M_SONGS; g.subSel = g.currentSong + 1; }
 }
 static void onBtMenu(int ev) {
     if (ev == 0) g.subSel = (g.subSel - 1 + 3) % 3;
     else if (ev == 1) g.subSel = (g.subSel + 1) % 3;
-    else if (ev == 2 && g.subSel == 0) { g.mode = M_BT_SCAN; }
+    else if (ev == 2 && g.subSel == 0) g.mode = M_BT_SCAN;
     else if (ev == 3) { g.mode = M_MAIN; g.mainSel = 2; }
 }
 static void onLedMenu(int ev) {
@@ -1067,7 +1006,7 @@ static void onLedMenu(int ev) {
     else if (ev == 1) g.subSel = (g.subSel + 1) % 4;
     else if (ev == 2) {
         if (g.subSel == 0) { g.mode = M_LED_FX; g.subSel = g.curEffect; }
-        else if (g.subSel == 2) { g.mode = M_LED_BRIGHT; }
+        else if (g.subSel == 2) g.mode = M_LED_BRIGHT;
         else if (g.subSel == 3) { g.mode = M_LED_WIFI; if (!webRunning) startWeb(); }
     } else if (ev == 3) { g.mode = M_MAIN; g.mainSel = 4; }
 }
@@ -1105,7 +1044,7 @@ static void onSettings(int ev) {
     else if (ev == 2) {
         if (g.subSel == 0) g.displaySleepEnabled = !g.displaySleepEnabled;
         else if (g.subSel == 1) { g.ledBright = (g.ledBright + 50) % 256; strip.setBrightness(g.ledBright); }
-    } else if (ev == 3) { g.mode = M_MAIN; }
+    } else if (ev == 3) g.mode = M_MAIN;
 }
 static void onWifiFiles(int ev) {
     if (ev == 3) { if (webRunning) stopWeb(); g.mode = M_SONGS; g.subSel = 0; }
@@ -1114,7 +1053,7 @@ static void onHidden(int ev) {
     if (ev == 0) g.subSel = (g.subSel - 1 + 3) % 3;
     else if (ev == 1) g.subSel = (g.subSel + 1) % 3;
     else if (ev == 2 && g.subSel == 0) { g.mode = M_WIFI_TOOLS; g.subSel = 0; }
-    else if (ev == 3) { g.mode = M_MAIN; }
+    else if (ev == 3) g.mode = M_MAIN;
 }
 static void onWifiTools(int ev) {
     if (ev == 0) g.subSel = (g.subSel - 1 + 4) % 4;
@@ -1130,29 +1069,12 @@ static void onAttack(int ev) {
     if (ev == 2 || ev == 3) { stopAttack(); g.mode = M_WIFI_TOOLS; g.subSel = 1; }
 }
 
-// ═══ BUTTONS ═══
-struct Btn { uint8_t pin; bool last; unsigned long t; bool lf; };
-static Btn bU = {BTN_UP, HIGH, 0, false};
-static Btn bD = {BTN_DOWN, HIGH, 0, false};
-static Btn bS = {BTN_SEL, HIGH, 0, false};
-static Btn bB = {BTN_BACK, HIGH, 0, false};
-
+// ═══ SERIAL POLLING ═══
 static int pollButtons() {
-    Btn* bs[4] = {&bU, &bD, &bS, &bB};
-    unsigned long now = millis();
-    for (int i = 0; i < 4; i++) {
-        Btn* b = bs[i];
-        bool cur = (digitalRead(b->pin) == LOW);
-        if (cur && b->last == HIGH) {
-            b->last = LOW; b->t = now; b->lf = false;
-        } else if (!cur && b->last == LOW) {
-            unsigned long held = now - b->t;
-            b->last = HIGH;
-            if (!b->lf && held >= DEBOUNCE_MS) return i;
-        } else if (cur && !b->lf && (now - b->t) >= LONGPRESS_MS) {
-            b->lf = true;
-            return 4 + i;
-        }
+    if (gSerialEv >= 0) {
+        int e = gSerialEv;
+        gSerialEv = -1;
+        return e;
     }
     return -1;
 }
@@ -1171,11 +1093,9 @@ static void uiTask(void*) {
             attackServer.handleClient();
         }
 
-        if (g.mode == M_LED_MENU || g.mode == M_LED_FX ||
-            g.mode == M_LED_WIFI) updateLED();
+        if (g.mode == M_LED_MENU || g.mode == M_LED_FX || g.mode == M_LED_WIFI) updateLED();
         if (g.flashOn) flashApply();
 
-        // button events
         if (ev >= 0 && ev < 4) {
             switch (g.mode) {
                 case M_MAIN: onMain(ev); break;
@@ -1193,12 +1113,6 @@ static void uiTask(void*) {
                 case M_WIFI_TOOLS: onWifiTools(ev); break;
                 case M_ATTACK_RUN: onAttack(ev); break;
                 default: if (ev == 3) g.mode = M_MAIN; break;
-            }
-        } else if (ev >= 4) {
-            int idx = ev - 4;
-            if (idx == 3) {
-                flashSet(!g.flashOn);
-                if (g.flashOn) { g.mode = M_FLASH_MENU; g.subSel = 0; }
             }
         }
 
@@ -1225,11 +1139,7 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n=== SOUMYA Gadget v9.0 ===");
-
-    pinMode(BTN_UP, INPUT_PULLUP);
-    pinMode(BTN_DOWN, INPUT_PULLUP);
-    pinMode(BTN_SEL, INPUT_PULLUP);
-    pinMode(BTN_BACK, INPUT_PULLUP);
+    Serial.println("Serial control: up/down/sel/back | help");
 
     SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
     if (!SD.begin(PIN_SD_CS)) Serial.println("[!] SD FAIL");
@@ -1258,6 +1168,35 @@ void setup() {
     xTaskCreatePinnedToCore(uiTask, "ui", 12288, nullptr, 1, nullptr, 0);
 }
 
+// ═══ LOOP — Serial command parser ═══
 void loop() {
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    static String cmdBuf = "";
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            cmdBuf.trim();
+            cmdBuf.toLowerCase();
+            if (cmdBuf == "up" || cmdBuf == "u") gSerialEv = 0;
+            else if (cmdBuf == "down" || cmdBuf == "d") gSerialEv = 1;
+            else if (cmdBuf == "sel" || cmdBuf == "s") gSerialEv = 2;
+            else if (cmdBuf == "back" || cmdBuf == "b") gSerialEv = 3;
+            else if (cmdBuf == "help" || cmdBuf == "?") {
+                Serial.println();
+                Serial.println("═══════════════════════════");
+                Serial.println("  SOUMYA Serial Commands");
+                Serial.println("═══════════════════════════");
+                Serial.println("  up / u       Navigate UP");
+                Serial.println("  down / d     Navigate DOWN");
+                Serial.println("  sel / s      SELECT");
+                Serial.println("  back / b     BACK");
+                Serial.println("  help / ?     This menu");
+                Serial.println("═══════════════════════════");
+                Serial.println();
+            }
+            cmdBuf = "";
+        } else {
+            cmdBuf += c;
+        }
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
 }
