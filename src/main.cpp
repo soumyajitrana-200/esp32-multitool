@@ -1,7 +1,7 @@
 // ============================================================
-//  SOUMYA — MP3 Player + BT TWS (Complete Fixed Version)
-//  Fixes: BT controller init, Bluedroid init, A2DP source
-//  Serial: play / next / prev / stop / list / vol / status
+//  SOUMYA — MP3 Player + BT TWS v1.2
+//  Fixed: discoverable + connectable BT mode
+//  Serial: play / next / prev / stop / list / vol / status / bt
 // ============================================================
 
 #include <Arduino.h>
@@ -15,6 +15,8 @@
 #include "esp32-hal-bt.h"
 #include "esp_bt.h"
 #include "esp_bt_main.h"
+#include "esp_bt_device.h"
+#include "esp_gap_bt_api.h"
 
 // ─── SD Pins ───
 #define PIN_SD_CS    5
@@ -22,12 +24,10 @@
 #define PIN_SD_MISO  19
 #define PIN_SD_MOSI  23
 
-// ─── Config ───
 #define MUSIC_DIR  "/music"
 #define BT_NAME    "SOUMYA-Music"
 #define RING_SIZE  32768
 
-// ─── BT Audio ───
 BluetoothA2DPSource a2dp;
 static bool a2dpStarted = false;
 
@@ -67,7 +67,7 @@ static bool rb_pop(int16_t &L, int16_t &R) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  Custom AudioOutput → ring buffer
+//  Custom AudioOutput
 // ═══════════════════════════════════════════════════════════
 class AudioOutputRingBuffer : public AudioOutput {
 public:
@@ -92,9 +92,6 @@ static int32_t a2dp_data_cb(Frame* frames, int32_t n) {
     return n;
 }
 
-// ═══════════════════════════════════════════════════════════
-//  Audio objects
-// ═══════════════════════════════════════════════════════════
 static AudioFileSource*       audioSrc = nullptr;
 static AudioGeneratorMP3*     audioMP3 = nullptr;
 static AudioOutputRingBuffer* audioRB  = nullptr;
@@ -121,7 +118,7 @@ void loadSongList() {
     songCount = 0;
     File dir = SD.open(MUSIC_DIR);
     if (!dir || !dir.isDirectory()) {
-        Serial.println("[!] /music folder missing");
+        Serial.println("[!] /music missing");
         return;
     }
     File f = dir.openNextFile();
@@ -142,7 +139,7 @@ void loadSongList() {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  BT A2DP Init
+//  BT A2DP Init — FULL
 // ═══════════════════════════════════════════════════════════
 void ensureBT() {
     if (a2dpStarted) return;
@@ -152,10 +149,9 @@ void ensureBT() {
 
     Serial.println("[*] btStart()...");
     if (!btStart()) {
-        Serial.println("[!] btStart FAILED");
         delay(500);
         if (!btStart()) {
-            Serial.println("[!] btStart FAILED twice — abort");
+            Serial.println("[!] btStart FAILED twice");
             return;
         }
     }
@@ -164,24 +160,30 @@ void ensureBT() {
 
     if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED) {
         esp_bluedroid_init();
-        Serial.println("[+] Bluedroid initialized");
     }
     if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) {
         esp_bluedroid_enable();
-        Serial.println("[+] Bluedroid enabled");
     }
+    Serial.printf("[+] Bluedroid status: %d\n", esp_bluedroid_get_status());
 
     Serial.println("[*] Starting A2DP source...");
-    a2dp.set_auto_reconnect(false);
+    a2dp.set_auto_reconnect(true);
     a2dp.set_volume(127);
     a2dp.start(BT_NAME, a2dp_data_cb);
     a2dpStarted = true;
     delay(500);
-    Serial.println("[+] A2DP source started — device broadcasting as SOUMYA-Music");
+
+    // ═══ KEY FIX: discoverable + connectable ═══
+    esp_bt_dev_set_device_name(BT_NAME);
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    delay(300);
+
+    Serial.println("[+] Device DISCOVERABLE + CONNECTABLE");
+    Serial.println("[+] Device name: SOUMYA-Music");
 }
 
 // ═══════════════════════════════════════════════════════════
-//  Playback control
+//  Playback
 // ═══════════════════════════════════════════════════════════
 void stopSong() {
     if (audioMP3 && audioMP3->isRunning()) audioMP3->stop();
@@ -203,16 +205,18 @@ void playSong(int idx) {
     String path = songFiles[idx];
 
     Serial.printf("\n[PLAY] %s\n", songName(idx).c_str());
-    Serial.printf("       Path: %s\n", path.c_str());
 
     if (!a2dpStarted) ensureBT();
 
     audioSrc = new AudioFileSourceSD(path.c_str());
-    if (!audioSrc) { Serial.println("[!] Cannot open file"); return; }
+    if (!audioSrc) {
+        Serial.println("[!] Cannot open file");
+        return;
+    }
 
     audioMP3 = new AudioGeneratorMP3();
     if (!audioMP3) {
-        Serial.println("[!] MP3 decoder create failed");
+        Serial.println("[!] MP3 decoder failed");
         delete audioSrc; audioSrc = nullptr;
         return;
     }
@@ -230,7 +234,6 @@ void nextSong() {
     if (songCount == 0) return;
     playSong((currentSong + 1) % songCount);
 }
-
 void prevSong() {
     if (songCount == 0) return;
     playSong((currentSong - 1 + songCount) % songCount);
@@ -241,19 +244,18 @@ void prevSong() {
 // ═══════════════════════════════════════════════════════════
 void printHelp() {
     Serial.println();
-    Serial.println("═══════════════════════════════════");
-    Serial.println("     SOUMYA MP3 → BT TWS");
-    Serial.println("═══════════════════════════════════");
-    Serial.println(" list            Show songs");
-    Serial.println(" play <n>        Play song #n (1-based)");
-    Serial.println(" play            Play first song");
-    Serial.println(" next / prev     Navigate");
-    Serial.println(" stop            Stop playback");
-    Serial.println(" vol <0-100>     Volume");
-    Serial.println(" status          Show state");
-    Serial.println(" bt              BT status");
-    Serial.println(" help            This menu");
-    Serial.println("═══════════════════════════════════");
+    Serial.println("═══════════════════════════════");
+    Serial.println("   SOUMYA MP3 → BT TWS");
+    Serial.println("═══════════════════════════════");
+    Serial.println(" list          Show songs");
+    Serial.println(" play <n>      Play song #n");
+    Serial.println(" next / prev   Navigate");
+    Serial.println(" stop          Stop");
+    Serial.println(" vol <0-100>   Volume");
+    Serial.println(" status        Full status");
+    Serial.println(" bt            BT status");
+    Serial.println(" help          This menu");
+    Serial.println("═══════════════════════════════");
     Serial.println();
 }
 
@@ -263,9 +265,11 @@ void showStatus() {
     Serial.printf("Songs:    %d\n", songCount);
     Serial.printf("Playing:  %s\n", isPlaying ? "YES" : "no");
     Serial.printf("Current:  %s\n", currentSong >= 0 ? songName(currentSong).c_str() : "(none)");
-    Serial.printf("Volume:   %d%%\n", volume);
+    Serial.printf("Volume:   %d\n", volume);
     Serial.printf("Ring:     %d / %d\n", rb_avail(), RING_SIZE);
-    Serial.printf("BT:       %s\n", a2dp.is_connected() ? "CONNECTED" : "waiting");
+    Serial.printf("BT conn:  %s\n", a2dp.is_connected() ? "CONNECTED" : "waiting");
+    Serial.printf("BT ctrl:  %d\n", esp_bt_controller_get_status());
+    Serial.printf("Blue:     %d\n", esp_bluedroid_get_status());
     Serial.printf("Heap:     %u\n", ESP.getFreeHeap());
     Serial.println("═════════════");
     Serial.println();
@@ -280,9 +284,9 @@ void handleCmd(String cmd) {
     if (lc == "help" || lc == "?") { printHelp(); return; }
     if (lc == "status" || lc == "st") { showStatus(); return; }
     if (lc == "bt") {
-        Serial.printf("BT: %s\n", a2dp.is_connected() ? "CONNECTED" : "waiting");
-        Serial.printf("BT controller status: %d\n", esp_bt_controller_get_status());
-        Serial.printf("Bluedroid status: %d\n", esp_bluedroid_get_status());
+        Serial.printf("Connected: %s\n", a2dp.is_connected() ? "YES" : "waiting");
+        Serial.printf("BT ctrl:   %d\n", esp_bt_controller_get_status());
+        Serial.printf("Bluedroid: %d\n", esp_bluedroid_get_status());
         return;
     }
     if (lc == "list") {
@@ -297,7 +301,6 @@ void handleCmd(String cmd) {
     if (lc == "stop") { stopSong(); Serial.println("[*] Stopped"); return; }
     if (lc == "next") { nextSong(); return; }
     if (lc == "prev") { prevSong(); return; }
-
     if (lc.startsWith("play ")) {
         int n = cmd.substring(5).toInt();
         playSong(n - 1);
@@ -307,15 +310,13 @@ void handleCmd(String cmd) {
         if (songCount > 0) playSong(0);
         return;
     }
-
     if (lc.startsWith("vol ")) {
         int v = constrain(cmd.substring(4).toInt(), 0, 100);
         volume = v;
         a2dp.set_volume(v * 2);
-        Serial.printf("[+] Volume %d%%\n", v);
+        Serial.printf("[+] Volume %d\n", v);
         return;
     }
-
     Serial.printf("[!] Unknown: %s\n", cmd.c_str());
 }
 
@@ -327,11 +328,10 @@ void setup() {
     delay(500);
     Serial.println();
     Serial.println("╔══════════════════════════════════════╗");
-    Serial.println("║   SOUMYA MP3 → BT TWS v1.1          ║");
+    Serial.println("║   SOUMYA MP3 → BT TWS v1.2          ║");
     Serial.println("╚══════════════════════════════════════╝");
     Serial.println();
 
-    // SD init
     SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
     if (!SD.begin(PIN_SD_CS)) {
         Serial.println("[!] SD mount FAIL");
@@ -340,13 +340,9 @@ void setup() {
         loadSongList();
     }
 
-    // Ring buffer
     audioRB = new AudioOutputRingBuffer();
-
-    // WiFi OFF
     WiFi.mode(WIFI_OFF);
 
-    // BT early init — broadcast SOUMYA-Music
     ensureBT();
 
     Serial.println();
@@ -375,9 +371,9 @@ void loop() {
     }
 
     static unsigned long lastMs = 0;
-    if (millis() - lastMs > 5000) {
+    if (millis() - lastMs > 10000) {
         lastMs = millis();
-        if (isPlaying || a2dpStarted) {
+        if (isPlaying) {
             Serial.printf("[♪] ring=%d BT=%s\n",
                 rb_avail(),
                 a2dp.is_connected() ? "YES" : "no");
