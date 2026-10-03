@@ -1,7 +1,6 @@
 // ============================================================
 //  SOUMYA Gadget v9.0 — Final Complete (Serial Control)
-//  No buttons needed — Serial commands work
-//  Core 2.0.17 with Deauth support
+//  DRAM optimized: RING_SIZE=8192, MAX_SONGS=32
 // ============================================================
 
 #include <Arduino.h>
@@ -35,7 +34,6 @@ extern "C" {
 
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return 0; }
 
-// ═══ PINS ═══
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_ADDR 0x3C
@@ -55,9 +53,9 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return
 #define AP_CHANNEL 6
 #define BT_NAME "SOUMYA-Music"
 #define MUSIC_DIR "/music"
-#define RING_SIZE 32768
+#define RING_SIZE 8192
+#define MAX_SONGS 32
 
-// ═══ ENUMS ═══
 enum Mode : uint8_t {
     M_BOOT, M_MAIN, M_SONGS, M_PLAYER,
     M_BT_MENU, M_BT_SCAN,
@@ -84,7 +82,6 @@ struct State {
     bool displaySleepEnabled = true;
 } g;
 
-// ═══ GLOBALS ═══
 Adafruit_SSD1306 display(SCR_W, SCR_H, &Wire, -1);
 Adafruit_NeoPixel strip(LED_MAX, PIN_LED_DATA, NEO_GRB + NEO_KHZ800);
 Adafruit_NeoPixel flashStrip(STATUS_LED_COUNT, PIN_STATUS_LED, NEO_GRB + NEO_KHZ800);
@@ -94,7 +91,6 @@ WebServer fileServer(81);
 WebServer attackServer(8080);
 static bool webRunning = false;
 
-#define MAX_SONGS 64
 String songFiles[MAX_SONGS];
 int songCount = 0;
 
@@ -117,8 +113,6 @@ static int apCount = 0;
 static unsigned long lastActivity = 0;
 static bool displayOff = false;
 static int animFrame = 0;
-
-// Serial command event
 static volatile int gSerialEv = -1;
 
 // ═══ RING BUFFER ═══
@@ -171,13 +165,10 @@ static AudioFileSource* audioSrc = nullptr;
 static AudioGeneratorMP3* audioMP3 = nullptr;
 static AudioOutRB* audioRB = nullptr;
 
-// ═══ DISPLAY HELPERS ═══
+// ═══ DISPLAY ═══
 static void wakeDisplay() {
     lastActivity = millis();
-    if (displayOff) {
-        displayOff = false;
-        display.ssd1306_command(SSD1306_DISPLAYON);
-    }
+    if (displayOff) { displayOff = false; display.ssd1306_command(SSD1306_DISPLAYON); }
 }
 static void checkSleep() {
     if (!g.displaySleepEnabled) return;
@@ -215,50 +206,13 @@ static void hdrL(const char* t) {
 
 // ═══ ICONS ═══
 static void iPlay(int x,int y,uint16_t c){display.fillTriangle(x+2,y+1,x+2,y+7,x+7,y+4,c);}
-static void iMusic(int x,int y,uint16_t c){
-    display.fillCircle(x+2,y+5,2,c);
-    display.drawFastVLine(x+3,y+1,5,c);
-    display.drawPixel(x+4,y+1,c); display.drawPixel(x+5,y+1,c);
-    display.drawPixel(x+6,y+2,c); display.drawPixel(x+6,y+3,c);
-    display.drawPixel(x+5,y+3,c);
-}
-static void iBT(int x,int y,uint16_t c){
-    display.drawFastVLine(x+4,y,8,c);
-    display.drawLine(x+4,y,x+6,y+2,c);
-    display.drawLine(x+6,y+2,x+2,y+4,c);
-    display.drawLine(x+4,y+7,x+6,y+5,c);
-    display.drawLine(x+6,y+5,x+2,y+3,c);
-}
-static void iGame(int x,int y,uint16_t c){
-    display.drawRect(x,y+1,8,6,c);
-    display.drawPixel(x+2,y+3,c); display.drawPixel(x+1,y+4,c);
-    display.drawPixel(x+2,y+4,c); display.drawPixel(x+3,y+4,c);
-    display.drawPixel(x+2,y+5,c); display.drawPixel(x+5,y+3,c);
-    display.drawPixel(x+5,y+5,c);
-}
-static void iLED(int x,int y,uint16_t c){
-    display.drawCircle(x+4,y+3,3,c);
-    display.fillRect(x+3,y+6,3,2,c);
-    display.drawPixel(x+4,y+3,c);
-}
-static void iFlash(int x,int y,uint16_t c){
-    display.fillRect(x+2,y,4,3,c);
-    display.fillRect(x+3,y+3,2,5,c);
-    display.drawPixel(x,y,c); display.drawPixel(x+7,y,c);
-}
-static void iWifi(int x,int y,uint16_t c){
-    display.drawPixel(x+2,y,c); display.drawPixel(x+3,y,c);
-    display.drawPixel(x+4,y,c); display.drawPixel(x+5,y,c);
-    display.drawPixel(x+1,y+1,c); display.drawPixel(x+6,y+1,c);
-    display.drawPixel(x,y+2,c); display.drawPixel(x+7,y+2,c);
-    display.drawPixel(x+2,y+3,c); display.drawPixel(x+3,y+3,c);
-    display.drawPixel(x+4,y+3,c); display.drawPixel(x+5,y+3,c);
-    display.drawPixel(x+1,y+4,c); display.drawPixel(x+6,y+4,c);
-    display.drawPixel(x+3,y+5,c); display.drawPixel(x+4,y+5,c);
-    display.fillRect(x+3,y+6,2,2,c);
-}
+static void iMusic(int x,int y,uint16_t c){display.fillCircle(x+2,y+5,2,c);display.drawFastVLine(x+3,y+1,5,c);display.drawPixel(x+4,y+1,c);display.drawPixel(x+5,y+1,c);display.drawPixel(x+6,y+2,c);display.drawPixel(x+6,y+3,c);display.drawPixel(x+5,y+3,c);}
+static void iBT(int x,int y,uint16_t c){display.drawFastVLine(x+4,y,8,c);display.drawLine(x+4,y,x+6,y+2,c);display.drawLine(x+6,y+2,x+2,y+4,c);display.drawLine(x+4,y+7,x+6,y+5,c);display.drawLine(x+6,y+5,x+2,y+3,c);}
+static void iGame(int x,int y,uint16_t c){display.drawRect(x,y+1,8,6,c);display.drawPixel(x+2,y+3,c);display.drawPixel(x+1,y+4,c);display.drawPixel(x+2,y+4,c);display.drawPixel(x+3,y+4,c);display.drawPixel(x+2,y+5,c);display.drawPixel(x+5,y+3,c);display.drawPixel(x+5,y+5,c);}
+static void iLED(int x,int y,uint16_t c){display.drawCircle(x+4,y+3,3,c);display.fillRect(x+3,y+6,3,2,c);display.drawPixel(x+4,y+3,c);}
+static void iFlash(int x,int y,uint16_t c){display.fillRect(x+2,y,4,3,c);display.fillRect(x+3,y+3,2,5,c);display.drawPixel(x,y,c);display.drawPixel(x+7,y,c);}
+static void iWifi(int x,int y,uint16_t c){display.drawPixel(x+2,y,c);display.drawPixel(x+3,y,c);display.drawPixel(x+4,y,c);display.drawPixel(x+5,y,c);display.drawPixel(x+1,y+1,c);display.drawPixel(x+6,y+1,c);display.drawPixel(x,y+2,c);display.drawPixel(x+7,y+2,c);display.drawPixel(x+2,y+3,c);display.drawPixel(x+3,y+3,c);display.drawPixel(x+4,y+3,c);display.drawPixel(x+5,y+3,c);display.drawPixel(x+1,y+4,c);display.drawPixel(x+6,y+4,c);display.drawPixel(x+3,y+5,c);display.drawPixel(x+4,y+5,c);display.fillRect(x+3,y+6,2,2,c);}
 
-// ═══ MENU ROW HELPER ═══
 static void drawRow(const char* txt, int y, bool s, int iconType) {
     if (s) {
         display.fillRoundRect(0, y, SCR_W, 10, 3, WHITE);
@@ -378,7 +332,7 @@ static void updateLED() {
     int n = g.ledCount;
     switch (g.curEffect) {
         case 0: for (int i = 0; i < n; i++) strip.setPixelColor(i, strip.ColorHSV(ledHue*257, 255, g.ledBright)); break;
-        case 1: for (int i = 0; i < n; i++) strip.setPixelColor(i, strip.ColorHSV((ledHue + i*256/n) & 0xFF * 257, 255, g.ledBright)); ledHue = (ledHue + 2) & 0xFF; break;
+        case 1: for (int i = 0; i < n; i++) strip.setPixelColor(i, strip.ColorHSV(((ledHue + i*256/n) & 0xFF) * 257, 255, g.ledBright)); ledHue = (ledHue + 2) & 0xFF; break;
         case 2: { float b = (sin(millis()/1000.0f)+1)/2; for (int i = 0; i < n; i++) strip.setPixelColor(i, strip.ColorHSV(ledHue*257, 255, b*g.ledBright)); break; }
         case 3: { strip.clear(); int p = (millis()/40)%n; for (int i = 0; i < 5; i++) strip.setPixelColor((p+i)%n, strip.ColorHSV(ledHue*257, 255, g.ledBright >> i)); break; }
     }
@@ -397,7 +351,7 @@ static void flashApply() {
 }
 static void flashSet(bool on) { g.flashOn = on; flashApply(); }
 
-// ═══ WIFI ATTACKS ═══
+// ═══ ATTACKS ═══
 static uint8_t deauthFrame[26] = {0xC0,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x07,0x00};
 
 static bool parseMac(const char* s, uint8_t* o) {
@@ -666,7 +620,7 @@ static void startWeb() {
     attackServer.on("/emergency", HTTP_POST, hEmergency);
     attackServer.begin();
     webRunning = true;
-    Serial.println("[WEB] AP active on 192.168.4.1");
+    Serial.println("[WEB] AP on 192.168.4.1");
 }
 static void stopWeb() {
     if (!webRunning) return;
@@ -675,7 +629,7 @@ static void stopWeb() {
     webRunning = false;
 }
 
-// ═══ SCREEN FUNCTIONS ═══
+// ═══ SCREENS ═══
 static void sBoot() {
     static int step = 0;
     static unsigned long lastMs = 0;
@@ -685,27 +639,19 @@ static void sBoot() {
     if (step == 0) { display.clearDisplay(); display.display(); lastMs = now; step = 1; return; }
     if (step >= 1 && step <= 6) {
         if (now - lastMs > 200) {
-            display.clearDisplay();
-            display.setTextSize(2); display.setTextColor(WHITE);
+            display.clearDisplay(); display.setTextSize(2); display.setTextColor(WHITE);
             for (int i = 0; i < step; i++) { display.setCursor(22+i*15, 20); display.print(n[i]); }
             if (step < 6) display.fillRect(22 + step*15, 20, 2, 16, WHITE);
-            display.display();
-            lastMs = now; step++;
+            display.display(); lastMs = now; step++;
         }
     } else if (step == 7) {
-        if (now - lastMs > 400) {
-            display.fillRect(22 + 6*15, 20, 2, 16, BLACK);
-            display.display();
-            lastMs = now; step++;
-        }
+        if (now - lastMs > 400) { display.fillRect(22 + 6*15, 20, 2, 16, BLACK); display.display(); lastMs = now; step++; }
     } else if (step >= 8 && step <= 36) {
         if (now - lastMs > 30) {
-            display.clearDisplay();
-            display.setTextSize(2); display.setTextColor(WHITE);
+            display.clearDisplay(); display.setTextSize(2); display.setTextColor(WHITE);
             for (int i = 0; i < 6; i++) { display.setCursor(22+i*15, 20); display.print(n[i]); }
             display.drawFastHLine(22, 42, w, WHITE);
-            display.display();
-            w += 3; lastMs = now; step++;
+            display.display(); w += 3; lastMs = now; step++;
         }
     } else if (step == 37) {
         if (now - lastMs > 400) { g.mode = M_MAIN; g.mainSel = 0; step = 0; w = 0; }
@@ -786,12 +732,9 @@ static void sPlayer() {
 static void sBtMenu() {
     display.clearDisplay(); hdr("BLUETOOTH");
     const char* it[] = {"Scan Devices","Connect Last","Forget Saved"};
-    for (int i = 0; i < 3; i++) {
-        drawRow(it[i], 16 + i*12, i == g.subSel, 2);
-    }
+    for (int i = 0; i < 3; i++) drawRow(it[i], 16 + i*12, i == g.subSel, 2);
     display.display();
 }
-
 static void sBtScan() {
     display.clearDisplay(); hdrL("BLUETOOTH");
     int cx=SCR_W/2, cy=26;
@@ -811,17 +754,9 @@ static void sBtScan() {
 }
 
 static const char* LED_M[] = {"Effects","Music Sync","Brightness","WiFi Control"};
-static void sLedMenu() {
-    display.clearDisplay(); hdr("LED EFFECTS");
-    drawMenuList(LED_M, 4, g.subSel, -1);
-    display.display();
-}
+static void sLedMenu() { display.clearDisplay(); hdr("LED EFFECTS"); drawMenuList(LED_M, 4, g.subSel, -1); display.display(); }
 static const char* FX[] = {"Solid","Rainbow","Breathe","Chase"};
-static void sLedFx() {
-    display.clearDisplay(); hdr("EFFECTS");
-    drawMenuList(FX, 4, g.subSel, -1);
-    display.display();
-}
+static void sLedFx() { display.clearDisplay(); hdr("EFFECTS"); drawMenuList(FX, 4, g.subSel, -1); display.display(); }
 static void sLedBright() {
     display.clearDisplay(); hdrL("BRIGHTNESS");
     int pct = (g.ledBright * 100) / 255;
@@ -850,7 +785,6 @@ static void sLedWifi() {
     if (webRunning) { display.setCursor(4, 58); display.print("192.168.4.1"); }
     display.display();
 }
-
 static void sFlash() {
     display.clearDisplay();
     display.drawFastHLine(0,0,SCR_W,WHITE);
@@ -873,14 +807,8 @@ static void sFlash() {
     }
     display.display();
 }
-
 static const char* SET[] = {"Display Sleep","Screen Bright","Auto BT","Device Info","Factory Reset"};
-static void sSettings() {
-    display.clearDisplay(); hdr("SETTINGS");
-    drawMenuList(SET, 5, g.subSel, -1);
-    display.display();
-}
-
+static void sSettings() { display.clearDisplay(); hdr("SETTINGS"); drawMenuList(SET, 5, g.subSel, -1); display.display(); }
 static void sWifiFiles() {
     display.clearDisplay(); hdrL("WIFI FILES");
     int cx=30, cy=32;
@@ -900,7 +828,6 @@ static void sWifiFiles() {
     display.setCursor(4, 55); display.print("Open browser to upload");
     display.display();
 }
-
 static const char* HID[] = {"WiFi Tools","BT Tools","IR Remote"};
 static void sHidden() {
     display.clearDisplay();
@@ -910,19 +837,11 @@ static void sHidden() {
     display.fillCircle(SCR_W-12, 6, 3, BLACK);
     display.fillRect(SCR_W-15, 8, 6, 2, BLACK);
     display.setTextColor(WHITE);
-    for (int i = 0; i < 3; i++) {
-        drawRow(HID[i], 18 + i*13, i == g.subSel, i==0?6:i==1?2:5);
-    }
+    for (int i = 0; i < 3; i++) drawRow(HID[i], 18 + i*13, i == g.subSel, i==0?6:i==1?2:5);
     display.display();
 }
-
 static const char* WT[] = {"Scan Networks","Beacon Spam","Deauth Attack","Probe Flood"};
-static void sWifiTools() {
-    display.clearDisplay(); hdrL("WIFI TOOLS");
-    drawMenuList(WT, 4, g.subSel, -1);
-    display.display();
-}
-
+static void sWifiTools() { display.clearDisplay(); hdrL("WIFI TOOLS"); drawMenuList(WT, 4, g.subSel, -1); display.display(); }
 static void sAttackRun() {
     display.clearDisplay();
     display.fillRect(0,0,SCR_W,13,WHITE);
@@ -966,7 +885,7 @@ static void drawCurrent() {
     }
 }
 
-// ═══ MENU HANDLERS ═══
+// ═══ HANDLERS ═══
 static void onMain(int ev) {
     if (ev == 0) g.mainSel = (g.mainSel - 1 + 6) % 6;
     else if (ev == 1) g.mainSel = (g.mainSel + 1) % 6;
@@ -1069,17 +988,12 @@ static void onAttack(int ev) {
     if (ev == 2 || ev == 3) { stopAttack(); g.mode = M_WIFI_TOOLS; g.subSel = 1; }
 }
 
-// ═══ SERIAL POLLING ═══
 static int pollButtons() {
-    if (gSerialEv >= 0) {
-        int e = gSerialEv;
-        gSerialEv = -1;
-        return e;
-    }
+    if (gSerialEv >= 0) { int e = gSerialEv; gSerialEv = -1; return e; }
     return -1;
 }
 
-// ═══ UI TASK ═══
+// ═══ TASKS ═══
 static void uiTask(void*) {
     unsigned long lastDraw = 0;
     for (;;) {
@@ -1139,7 +1053,7 @@ void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.println("\n=== SOUMYA Gadget v9.0 ===");
-    Serial.println("Serial control: up/down/sel/back | help");
+    Serial.println("Serial: up/down/sel/back | help");
 
     SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
     if (!SD.begin(PIN_SD_CS)) Serial.println("[!] SD FAIL");
@@ -1168,7 +1082,6 @@ void setup() {
     xTaskCreatePinnedToCore(uiTask, "ui", 12288, nullptr, 1, nullptr, 0);
 }
 
-// ═══ LOOP — Serial command parser ═══
 void loop() {
     static String cmdBuf = "";
     while (Serial.available()) {
@@ -1189,7 +1102,7 @@ void loop() {
                 Serial.println("  down / d     Navigate DOWN");
                 Serial.println("  sel / s      SELECT");
                 Serial.println("  back / b     BACK");
-                Serial.println("  help / ?     This menu");
+                Serial.println("  help / ?     Menu");
                 Serial.println("═══════════════════════════");
                 Serial.println();
             }
