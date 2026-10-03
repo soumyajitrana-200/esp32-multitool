@@ -1,11 +1,5 @@
 // ============================================================
 //  SOUMYA Gadget v9.2 — Complete Merged Build
-//  - Real BT discovery + A2DP with MEDIA_CTRL_START
-//  - Smooth UI engine (smTick)
-//  - FastLED (RMT, non-blocking)
-//  - Batched audio callback
-//  - Async WiFi scan
-//  - Web task + OTA
 // ============================================================
 
 #include <Arduino.h>
@@ -40,7 +34,6 @@ extern "C" {
 
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return 0; }
 
-// ─────────────────────── Pins ───────────────────────
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_ADDR 0x3C
@@ -64,7 +57,6 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return
 #define MAX_SONGS 32
 #define UPDATE_FILE "/update/firmware.bin"
 
-// ─────────────────────── Types ───────────────────────
 enum Mode : uint8_t {
     M_BOOT, M_MAIN, M_SONGS, M_PLAYER,
     M_BT_MENU, M_BT_SCAN, M_BT_DEV,
@@ -92,7 +84,6 @@ struct State {
     bool displaySleepEnabled = true;
 } g;
 
-// ─────────────────────── Globals ───────────────────────
 Adafruit_SSD1306 display(SCR_W, SCR_H, &Wire, -1);
 CRGB mainLeds[LED_MAX];
 CRGB flashLeds[STATUS_LED_COUNT];
@@ -104,18 +95,15 @@ String songFiles[MAX_SONGS];
 int songCount = 0;
 static bool a2dpStarted = false;
 
-// Ring buffer
 static int16_t ringBuf[RING_SIZE];
 static volatile int rbHead = 0, rbTail = 0;
 static portMUX_TYPE rbMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile float gRMS = 0.0f;
 
-// A2DP state
 static volatile bool a2dpConnected = false;
 static volatile bool a2dpStreaming = false;
 static volatile int  a2dpCbCount = 0;
 
-// BT discovery
 struct BtDev { char name[32]; char mac[18]; int rssi; };
 static BtDev btDevs[16];
 static volatile int btDevCount = 0;
@@ -124,7 +112,6 @@ static int btSel = 0;
 static int btConnectTarget = -1;
 static unsigned long btConnectStart = 0;
 
-// Attacks
 static volatile bool atkRun = false;
 static AttackMode atkMode = ATK_NONE;
 static TaskHandle_t atkTask = nullptr;
@@ -142,7 +129,6 @@ static bool displayOff = false;
 static int animFrame = 0;
 static volatile int gSerialEv = -1;
 
-// Web command queue
 struct WebCmd {
     enum T : uint8_t {
         NONE, PLAY, NEXT, PREV, STOP,
@@ -156,7 +142,6 @@ struct WebCmd {
 };
 static QueueHandle_t cmdQueue = nullptr;
 
-// Smooth UI
 #define SMOOTH_RATE 16.0f
 float smSel = 0, smScroll = 0;
 uint8_t smScene = 255;
@@ -176,7 +161,6 @@ void smTick(uint8_t scene, float ts, float tsc){
     smScene = scene; smLastMs = now;
 }
 
-// ─────────────────────── Ring buffer ───────────────────────
 static inline int rb_avail(){ return (rbHead - rbTail + RING_SIZE) % RING_SIZE; }
 
 static void rb_push(int16_t L, int16_t R){
@@ -197,7 +181,6 @@ public:
     bool stop() override { return true; }
 };
 
-// ─────────────────────── A2DP callbacks ───────────────────────
 static int32_t a2d_data_cb(uint8_t* buf, int32_t len){
     a2dpCbCount++;
     int16_t* out = (int16_t*)buf;
@@ -253,7 +236,6 @@ static void a2d_conn_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* param) {
     }
 }
 
-// ─────────────────────── BT discovery ───────────────────────
 static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
     if (event == ESP_BT_GAP_DISC_RES_EVT) {
         char bda[18];
@@ -291,7 +273,6 @@ static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
     }
 }
 
-// ─────────────────────── Audio ───────────────────────
 static AudioFileSource*  audioSrc = nullptr;
 static AudioGeneratorMP3* audioMP3 = nullptr;
 static AudioOutRB*       audioRB  = nullptr;
@@ -341,7 +322,7 @@ void ensureBT(){
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
     esp_bt_gap_register_callback(bt_gap_cb);
     esp_a2d_source_init();
-    esp_a2d_source_register_callback(a2d_conn_cb);
+    esp_a2d_register_callback(a2d_conn_cb);
     esp_a2d_source_register_data_callback(a2d_data_cb);
     delay(150);
     a2dpStarted = true;
@@ -406,7 +387,6 @@ static void btConnect(int idx) {
     Serial.printf("[BT] Connect result: %d\n", r);
 }
 
-// ─────────────────────── LED ───────────────────────
 static int ledHue = 0;
 static void updateLED(){
     static unsigned long last = 0;
@@ -456,7 +436,6 @@ static void flashApply(){
 }
 static void flashSet(bool on){ g.flashOn = on; flashApply(); }
 
-// ─────────────────────── Attacks ───────────────────────
 static uint8_t deauthFrame[26] = {0xC0,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x07,0x00};
 
 static bool parseMac(const char* s, uint8_t* o){
@@ -606,7 +585,6 @@ static void pollScan(){
     scanReady = true;
 }
 
-// ─────────────────────── OTA ───────────────────────
 static bool checkAndFlashUpdate(){
     if (!SD.exists(UPDATE_FILE)) return false;
     File f = SD.open(UPDATE_FILE, FILE_READ);
@@ -654,7 +632,6 @@ static bool checkAndFlashUpdate(){
     return true;
 }
 
-// ─────────────────────── Web handlers ───────────────────────
 static void hLedRoot() { ledServer.send_P(200, "text/html", LED_MUSIC_HTML); }
 static void hLedCmd(){
     if (ledServer.hasArg("effect"))     { WebCmd c(WebCmd::SET_EFFECT, ledServer.arg("effect").toInt());     xQueueSend(cmdQueue, &c, 0); }
@@ -833,7 +810,6 @@ static void stopWeb(){
     webRunning = false;
 }
 
-// ─────────────────────── Display helpers ───────────────────────
 static void wakeDisplay(){
     lastActivity = millis();
     if (displayOff) { displayOff = false; display.ssd1306_command(SSD1306_DISPLAYON); }
@@ -876,7 +852,6 @@ static void hdrL(const char* t){
     drawBatteryLight(SCR_W-22,4);
 }
 
-// Icons
 static void iPlay(int x,int y,uint16_t c){display.fillTriangle(x+2,y+1,x+2,y+7,x+7,y+4,c);}
 static void iMusic(int x,int y,uint16_t c){display.fillCircle(x+2,y+5,2,c);display.drawFastVLine(x+3,y+1,5,c);display.drawPixel(x+4,y+1,c);display.drawPixel(x+5,y+1,c);display.drawPixel(x+6,y+2,c);display.drawPixel(x+6,y+3,c);display.drawPixel(x+5,y+3,c);}
 static void iBT(int x,int y,uint16_t c){display.drawFastVLine(x+4,y,8,c);display.drawLine(x+4,y,x+6,y+2,c);display.drawLine(x+6,y+2,x+2,y+4,c);display.drawLine(x+4,y+7,x+6,y+5,c);display.drawLine(x+6,y+5,x+2,y+3,c);}
@@ -892,7 +867,6 @@ static void iGameL(int x,int y,uint16_t c){display.drawRoundRect(x,y+2,16,12,4,c
 static void iLEDL(int x,int y,uint16_t c){display.drawCircle(x+8,y+6,5,c);display.fillRect(x+6,y+12,5,4,c);display.drawPixel(x+8,y+6,c);display.drawPixel(x+6,y+5,c);display.drawPixel(x+10,y+5,c);}
 static void iFlashL(int x,int y,uint16_t c){display.fillRect(x+5,y,6,5,c);display.fillRect(x+6,y+5,4,11,c);display.drawLine(x,y,x+3,y+3,c);display.drawLine(x+15,y,x+12,y+3,c);}
 
-// ─────────────────────── Screens ───────────────────────
 static void sBoot(){
     static int step = 0; static unsigned long lastMs = 0; static int w = 0;
     const char* n = "SOUMYA"; unsigned long now = millis();
@@ -1023,7 +997,6 @@ static void sBtMenu(){
     display.setTextColor(WHITE); display.display();
 }
 
-// ─────────────────────── BT SCAN (v9.1 style) ───────────────────────
 static void sBtScan(){
     display.clearDisplay(); hdrL("SCANNING");
     int cx = SCR_W/2, cy = 34;
@@ -1044,7 +1017,6 @@ static void sBtScan(){
             if (len < 25) display.drawPixel(sx-1, sy, 0x7BEF);
         }
     }
-    // Blips for found devices
     for (int i = 0; i < btDevCount; i++) {
         uint16_t s = i * 7919 + 100;
         int a = (s * 13) % 360;
@@ -1110,7 +1082,6 @@ static void sBtConn(){
     float eased = t - 1.0f; eased = eased*eased*eased + 1.0f;
     int prog = (int)roundf(eased * 100.0f);
 
-    // Hexagon
     float angleStep = 6.2832f / 6.0f;
     for (int i = 0; i < 6; i++) {
         float a1 = i * angleStep - 1.5708f;
@@ -1431,7 +1402,6 @@ static void drawCurrent(){
     }
 }
 
-// ─────────────────────── Menu handlers ───────────────────────
 static void onMain(int ev){
     if (ev == 0) g.mainSel = (g.mainSel - 1 + 6) % 6;
     else if (ev == 1) g.mainSel = (g.mainSel + 1) % 6;
@@ -1560,7 +1530,6 @@ static int pollButtons(){
     return -1;
 }
 
-// ─────────────────────── Tasks ───────────────────────
 static void webTask(void*){
     for (;;) {
         if (webRunning) ledServer.handleClient();
@@ -1609,7 +1578,6 @@ static void uiTask(void*){
                     if (btScanning) {
                         if (ev == 2 || ev == 3) stopBtDiscovery();
                     } else if (btConnectTarget >= 0 && !a2dpConnected && (millis() - btConnectStart) < 8000) {
-                        // connect animation — ignore
                     } else {
                         if (ev == 0 && btSel > 0) btSel--;
                         else if (ev == 1 && btSel < btDevCount - 1) btSel++;
@@ -1655,7 +1623,6 @@ static void audioTask(void*){
     }
 }
 
-// ─────────────────────── Setup ───────────────────────
 void setup(){
     Serial.begin(115200);
     delay(500);
