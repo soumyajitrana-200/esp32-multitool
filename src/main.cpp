@@ -1,6 +1,11 @@
 // ============================================================
-//  SOUMYA Gadget v9.1 — FIXED & OPTIMIZED + SD CARD OTA
-//  FastLED (RMT) + Batched audio + Async scan + Web task
+//  SOUMYA Gadget v9.2 — Complete Merged Build
+//  - Real BT discovery + A2DP with MEDIA_CTRL_START
+//  - Smooth UI engine (smTick)
+//  - FastLED (RMT, non-blocking)
+//  - Batched audio callback
+//  - Async WiFi scan
+//  - Web task + OTA
 // ============================================================
 
 #include <Arduino.h>
@@ -35,6 +40,7 @@ extern "C" {
 
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return 0; }
 
+// ─────────────────────── Pins ───────────────────────
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_ADDR 0x3C
@@ -58,11 +64,12 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return
 #define MAX_SONGS 32
 #define UPDATE_FILE "/update/firmware.bin"
 
+// ─────────────────────── Types ───────────────────────
 enum Mode : uint8_t {
     M_BOOT, M_MAIN, M_SONGS, M_PLAYER,
-    M_BT_MENU, M_BT_SCAN,
+    M_BT_MENU, M_BT_SCAN, M_BT_DEV,
     M_GAMES,
-    M_LED_MENU, M_LED_FX, M_LED_MUSIC, M_LED_BRIGHT, M_LED_WIFI,
+    M_LED_MENU, M_LED_FX, M_LED_MUS, M_LED_BRIGHT, M_LED_WIFI,
     M_FLASH_MENU, M_SETTINGS, M_INFO, M_WIFI_FILES,
     M_HIDDEN, M_WIFI_TOOLS, M_BT_TOOLS, M_IR_MENU,
     M_ATTACK_RUN, M_IR_LEARN, M_IR_TX, M_IR_JAM
@@ -85,6 +92,7 @@ struct State {
     bool displaySleepEnabled = true;
 } g;
 
+// ─────────────────────── Globals ───────────────────────
 Adafruit_SSD1306 display(SCR_W, SCR_H, &Wire, -1);
 CRGB mainLeds[LED_MAX];
 CRGB flashLeds[STATUS_LED_COUNT];
@@ -96,11 +104,27 @@ String songFiles[MAX_SONGS];
 int songCount = 0;
 static bool a2dpStarted = false;
 
+// Ring buffer
 static int16_t ringBuf[RING_SIZE];
 static volatile int rbHead = 0, rbTail = 0;
 static portMUX_TYPE rbMux = portMUX_INITIALIZER_UNLOCKED;
 static volatile float gRMS = 0.0f;
 
+// A2DP state
+static volatile bool a2dpConnected = false;
+static volatile bool a2dpStreaming = false;
+static volatile int  a2dpCbCount = 0;
+
+// BT discovery
+struct BtDev { char name[32]; char mac[18]; int rssi; };
+static BtDev btDevs[16];
+static volatile int btDevCount = 0;
+static volatile bool btScanning = false;
+static int btSel = 0;
+static int btConnectTarget = -1;
+static unsigned long btConnectStart = 0;
+
+// Attacks
 static volatile bool atkRun = false;
 static AttackMode atkMode = ATK_NONE;
 static TaskHandle_t atkTask = nullptr;
@@ -118,7 +142,7 @@ static bool displayOff = false;
 static int animFrame = 0;
 static volatile int gSerialEv = -1;
 
-// WebCmd with proper constructors
+// Web command queue
 struct WebCmd {
     enum T : uint8_t {
         NONE, PLAY, NEXT, PREV, STOP,
@@ -132,6 +156,7 @@ struct WebCmd {
 };
 static QueueHandle_t cmdQueue = nullptr;
 
+// Smooth UI
 #define SMOOTH_RATE 16.0f
 float smSel = 0, smScroll = 0;
 uint8_t smScene = 255;
@@ -151,6 +176,7 @@ void smTick(uint8_t scene, float ts, float tsc){
     smScene = scene; smLastMs = now;
 }
 
+// ─────────────────────── Ring buffer ───────────────────────
 static inline int rb_avail(){ return (rbHead - rbTail + RING_SIZE) % RING_SIZE; }
 
 static void rb_push(int16_t L, int16_t R){
@@ -171,7 +197,9 @@ public:
     bool stop() override { return true; }
 };
 
+// ─────────────────────── A2DP callbacks ───────────────────────
 static int32_t a2d_data_cb(uint8_t* buf, int32_t len){
+    a2dpCbCount++;
     int16_t* out = (int16_t*)buf;
     int frames = len / 4;
     int n = 0;
@@ -184,12 +212,86 @@ static int32_t a2d_data_cb(uint8_t* buf, int32_t len){
     }
     portEXIT_CRITICAL(&rbMux);
     if (n < frames) memset(&out[n*2], 0, (frames - n) * 4);
+
     int64_t sum = 0;
     for (int i = 0; i < n; i++) { int32_t s = out[i*2]; sum += (int64_t)s * s; }
     if (n > 0) gRMS = sqrtf((float)sum / n) / 32768.0f;
     return len;
 }
 
+static void a2d_conn_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* param) {
+    switch (event) {
+        case ESP_A2D_CONNECTION_STATE_EVT: {
+            uint8_t st = param->conn_stat.state;
+            if (st == ESP_A2D_CONNECTION_STATE_CONNECTED) {
+                a2dpConnected = true;
+                Serial.println("[A2DP] CONNECTED");
+                esp_err_t r = esp_a2d_media_ctrl(ESP_A2D_MEDIA_CTRL_START);
+                Serial.printf("[A2DP] Media START: %d\n", r);
+            } else if (st == ESP_A2D_CONNECTION_STATE_DISCONNECTED) {
+                a2dpConnected = false;
+                a2dpStreaming = false;
+                Serial.println("[A2DP] DISCONNECTED");
+            }
+            break;
+        }
+        case ESP_A2D_AUDIO_STATE_EVT: {
+            uint8_t st = param->audio_stat.state;
+            if (st == ESP_A2D_AUDIO_STATE_STARTED) {
+                a2dpStreaming = true;
+                Serial.println("[A2DP] ★ STREAM STARTED ★");
+            } else if (st == ESP_A2D_AUDIO_STATE_STOPPED) {
+                a2dpStreaming = false;
+                Serial.println("[A2DP] Audio STOPPED");
+            }
+            break;
+        }
+        case ESP_A2D_AUDIO_CFG_EVT:
+            Serial.println("[A2DP] Codec configured");
+            break;
+        default: break;
+    }
+}
+
+// ─────────────────────── BT discovery ───────────────────────
+static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+    if (event == ESP_BT_GAP_DISC_RES_EVT) {
+        char bda[18];
+        sprintf(bda, "%02X:%02X:%02X:%02X:%02X:%02X",
+            param->disc_res.bda[0], param->disc_res.bda[1],
+            param->disc_res.bda[2], param->disc_res.bda[3],
+            param->disc_res.bda[4], param->disc_res.bda[5]);
+        char nm[32] = {0};
+        int rssi = -70;
+        for (int i = 0; i < param->disc_res.num_prop; i++) {
+            if (param->disc_res.prop[i].type == ESP_BT_GAP_DEV_PROP_BDNAME) {
+                int len = param->disc_res.prop[i].len;
+                if (len > 31) len = 31;
+                memcpy(nm, param->disc_res.prop[i].val, len);
+                nm[len] = 0;
+            } else if (param->disc_res.prop[i].type == ESP_BT_GAP_DEV_PROP_RSSI) {
+                rssi = *(int8_t*)param->disc_res.prop[i].val;
+            }
+        }
+        if (nm[0] == 0) strcpy(nm, "(unnamed)");
+        for (int i = 0; i < btDevCount; i++)
+            if (strcmp(btDevs[i].mac, bda) == 0) return;
+        if (btDevCount < 16) {
+            strncpy(btDevs[btDevCount].name, nm, 31); btDevs[btDevCount].name[31] = 0;
+            strncpy(btDevs[btDevCount].mac, bda, 17); btDevs[btDevCount].mac[17] = 0;
+            btDevs[btDevCount].rssi = rssi;
+            btDevCount++;
+            Serial.printf("[BT] %s [%s] %d dBm\n", nm, bda, rssi);
+        }
+    } else if (event == ESP_BT_GAP_DISC_STATE_CHANGED_EVT) {
+        if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+            btScanning = false;
+            Serial.println("[BT] Scan complete");
+        }
+    }
+}
+
+// ─────────────────────── Audio ───────────────────────
 static AudioFileSource*  audioSrc = nullptr;
 static AudioGeneratorMP3* audioMP3 = nullptr;
 static AudioOutRB*       audioRB  = nullptr;
@@ -202,63 +304,6 @@ static int readBattery(){
     if (v <= 3.30f) return 0;
     return (int)((v - 3.30f) / (4.15f - 3.30f) * 100);
 }
-
-static void wakeDisplay(){
-    lastActivity = millis();
-    if (displayOff) { displayOff = false; display.ssd1306_command(SSD1306_DISPLAYON); }
-}
-static void checkSleep(){
-    if (!g.displaySleepEnabled || displayOff) return;
-    if (millis() - lastActivity > 30000) {
-        displayOff = true;
-        display.clearDisplay(); display.display();
-        display.ssd1306_command(SSD1306_DISPLAYOFF);
-    }
-}
-static void drawBatteryDark(int x,int y){
-    display.drawRect(x,y,16,9,BLACK);
-    display.fillRect(x+16,y+3,2,3,BLACK);
-    int f=(g.batteryPct*12)/100;
-    if(f>0) display.fillRect(x+2,y+2,f,5,BLACK);
-}
-static void drawBatteryLight(int x,int y){
-    display.drawRect(x,y,16,9,WHITE);
-    display.fillRect(x+16,y+3,2,3,WHITE);
-    int f=(g.batteryPct*12)/100;
-    if(f>0) display.fillRect(x+2,y+2,f,5,WHITE);
-}
-static void hdr(const char* t){
-    display.fillRect(0,0,SCR_W,13,WHITE);
-    display.setTextColor(BLACK);
-    display.setTextSize(1);
-    display.setCursor(4,3);
-    display.print(t);
-    drawBatteryDark(SCR_W-22,2);
-    display.setTextColor(WHITE);
-}
-static void hdrL(const char* t){
-    display.drawFastHLine(0,0,SCR_W,WHITE);
-    display.setTextColor(WHITE);
-    display.setTextSize(1);
-    display.setCursor(4,5);
-    display.print(t);
-    drawBatteryLight(SCR_W-22,4);
-}
-
-static void iPlay(int x,int y,uint16_t c){display.fillTriangle(x+2,y+1,x+2,y+7,x+7,y+4,c);}
-static void iMusic(int x,int y,uint16_t c){display.fillCircle(x+2,y+5,2,c);display.drawFastVLine(x+3,y+1,5,c);display.drawPixel(x+4,y+1,c);display.drawPixel(x+5,y+1,c);display.drawPixel(x+6,y+2,c);display.drawPixel(x+6,y+3,c);display.drawPixel(x+5,y+3,c);}
-static void iBT(int x,int y,uint16_t c){display.drawFastVLine(x+4,y,8,c);display.drawLine(x+4,y,x+6,y+2,c);display.drawLine(x+6,y+2,x+2,y+4,c);display.drawLine(x+4,y+7,x+6,y+5,c);display.drawLine(x+6,y+5,x+2,y+3,c);}
-static void iGame(int x,int y,uint16_t c){display.drawRect(x,y+1,8,6,c);display.drawPixel(x+2,y+3,c);display.drawPixel(x+1,y+4,c);display.drawPixel(x+2,y+4,c);display.drawPixel(x+3,y+4,c);display.drawPixel(x+2,y+5,c);display.drawPixel(x+5,y+3,c);display.drawPixel(x+5,y+5,c);}
-static void iLED(int x,int y,uint16_t c){display.drawCircle(x+4,y+3,3,c);display.fillRect(x+3,y+6,3,2,c);display.drawPixel(x+4,y+3,c);}
-static void iFlash(int x,int y,uint16_t c){display.fillRect(x+2,y,4,3,c);display.fillRect(x+3,y+3,2,5,c);display.drawPixel(x,y,c);display.drawPixel(x+7,y,c);}
-static void iWifi(int x,int y,uint16_t c){display.drawPixel(x+2,y,c);display.drawPixel(x+3,y,c);display.drawPixel(x+4,y,c);display.drawPixel(x+5,y,c);display.drawPixel(x+1,y+1,c);display.drawPixel(x+6,y+1,c);display.drawPixel(x,y+2,c);display.drawPixel(x+7,y+2,c);display.drawPixel(x+2,y+3,c);display.drawPixel(x+3,y+3,c);display.drawPixel(x+4,y+3,c);display.drawPixel(x+5,y+3,c);display.drawPixel(x+1,y+4,c);display.drawPixel(x+6,y+4,c);display.drawPixel(x+3,y+5,c);display.drawPixel(x+4,y+5,c);display.fillRect(x+3,y+6,2,2,c);}
-
-static void iPlayL(int x,int y,uint16_t c){display.fillTriangle(x+4,y+2,x+4,y+14,x+14,y+8,c);}
-static void iMusicL(int x,int y,uint16_t c){display.fillCircle(x+4,y+11,3,c);display.fillCircle(x+11,y+9,3,c);display.drawFastVLine(x+6,y+3,8,c);display.drawFastVLine(x+13,y+1,8,c);display.drawFastHLine(x+6,y+1,8,c);display.drawFastHLine(x+6,y+2,8,c);}
-static void iBTL(int x,int y,uint16_t c){display.drawFastVLine(x+8,y,16,c);display.drawLine(x+8,y,x+14,y+4,c);display.drawLine(x+14,y+4,x+2,y+11,c);display.drawLine(x+8,y+15,x+14,y+11,c);display.drawLine(x+14,y+11,x+2,y+4,c);}
-static void iGameL(int x,int y,uint16_t c){display.drawRoundRect(x,y+2,16,12,4,c);display.drawPixel(x+3,y+7,c);display.drawPixel(x+5,y+7,c);display.drawPixel(x+4,y+6,c);display.drawPixel(x+4,y+8,c);display.fillCircle(x+12,y+8,2,c);display.fillCircle(x+12,y+5,2,c);}
-static void iLEDL(int x,int y,uint16_t c){display.drawCircle(x+8,y+6,5,c);display.fillRect(x+6,y+12,5,4,c);display.drawPixel(x+8,y+6,c);display.drawPixel(x+6,y+5,c);display.drawPixel(x+10,y+5,c);}
-static void iFlashL(int x,int y,uint16_t c){display.fillRect(x+5,y,6,5,c);display.fillRect(x+6,y+5,4,11,c);display.drawLine(x,y,x+3,y+3,c);display.drawLine(x+15,y,x+12,y+3,c);}
 
 void loadSongs(){
     songCount = 0;
@@ -282,20 +327,27 @@ String songName(int idx){
     int s = p.lastIndexOf('/');
     return s >= 0 ? p.substring(s+1) : p;
 }
+
 void ensureBT(){
     if (a2dpStarted) return;
     esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-    if (!btStart()) return;
-    delay(200);
-    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED) esp_bluedroid_init();
-    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED) esp_bluedroid_enable();
+    if (!btStart()) { Serial.println("[BT] btStart failed"); return; }
+    delay(150);
+    if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_UNINITIALIZED)
+        esp_bluedroid_init();
+    if (esp_bluedroid_get_status() != ESP_BLUEDROID_STATUS_ENABLED)
+        esp_bluedroid_enable();
     esp_bt_dev_set_device_name(BT_NAME);
     esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    esp_bt_gap_register_callback(bt_gap_cb);
     esp_a2d_source_init();
+    esp_a2d_source_register_callback(a2d_conn_cb);
     esp_a2d_source_register_data_callback(a2d_data_cb);
-    delay(200);
+    delay(150);
     a2dpStarted = true;
+    Serial.println("[BT] Stack ready");
 }
+
 void stopSong(){
     if (audioMP3 && audioMP3->isRunning()) audioMP3->stop();
     if (audioSrc) audioSrc->close();
@@ -319,6 +371,42 @@ void playSong(int idx){
 void nextSong(){ if (songCount) playSong((g.currentSong + 1) % songCount); }
 void prevSong(){ if (songCount) playSong((g.currentSong - 1 + songCount) % songCount); }
 
+static void startBtDiscovery() {
+    if (btScanning) return;
+    if (!a2dpStarted) ensureBT();
+    btDevCount = 0;
+    btSel = 0;
+    esp_bt_gap_register_callback(bt_gap_cb);
+    esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+    esp_bt_gap_start_discovery(ESP_BT_INQ_MODE_GENERAL_INQUIRY, 20, 0);
+    btScanning = true;
+    Serial.println("[BT] Discovery started");
+}
+static void stopBtDiscovery() {
+    if (!btScanning) return;
+    esp_bt_gap_cancel_discovery();
+    btScanning = false;
+}
+static void btConnect(int idx) {
+    if (idx < 0 || idx >= btDevCount) return;
+    if (!a2dpStarted) ensureBT();
+    btConnectTarget = idx;
+    btConnectStart = millis();
+    a2dpConnected = false;
+    a2dpStreaming = false;
+
+    uint8_t bda[6];
+    unsigned int v[6];
+    sscanf(btDevs[idx].mac, "%x:%x:%x:%x:%x:%x",
+           &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
+    for (int i = 0; i < 6; i++) bda[i] = (uint8_t)v[i];
+
+    Serial.printf("[BT] Connecting to %s\n", btDevs[idx].name);
+    esp_err_t r = esp_a2d_source_connect(bda);
+    Serial.printf("[BT] Connect result: %d\n", r);
+}
+
+// ─────────────────────── LED ───────────────────────
 static int ledHue = 0;
 static void updateLED(){
     static unsigned long last = 0;
@@ -368,6 +456,7 @@ static void flashApply(){
 }
 static void flashSet(bool on){ g.flashOn = on; flashApply(); }
 
+// ─────────────────────── Attacks ───────────────────────
 static uint8_t deauthFrame[26] = {0xC0,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x07,0x00};
 
 static bool parseMac(const char* s, uint8_t* o){
@@ -517,28 +606,26 @@ static void pollScan(){
     scanReady = true;
 }
 
+// ─────────────────────── OTA ───────────────────────
 static bool checkAndFlashUpdate(){
     if (!SD.exists(UPDATE_FILE)) return false;
     File f = SD.open(UPDATE_FILE, FILE_READ);
     if (!f) return false;
     size_t size = f.size();
-    Serial.printf("[OTA] Found firmware.bin (%u bytes)\n", (unsigned)size);
+    Serial.printf("[OTA] Found %u bytes\n", (unsigned)size);
     if (size == 0 || size > 4 * 1024 * 1024) {
-        Serial.println("[OTA] Size invalid, removing");
-        f.close();
-        SD.remove(UPDATE_FILE);
+        f.close(); SD.remove(UPDATE_FILE);
         return false;
     }
     display.clearDisplay();
     display.setTextColor(WHITE);
     display.setTextSize(1);
     display.setCursor(6, 20); display.print("FIRMWARE UPDATE");
-    display.setCursor(6, 34); display.print("Flashing... do not");
-    display.setCursor(6, 46); display.print("power off!");
+    display.setCursor(6, 34); display.print("Flashing...");
+    display.setCursor(6, 46); display.print("Do not power off!");
     display.display();
 
     if (!Update.begin(size)) {
-        Serial.println("[OTA] Update.begin failed");
         f.close(); SD.remove(UPDATE_FILE);
         return false;
     }
@@ -547,7 +634,6 @@ static bool checkAndFlashUpdate(){
     while (f.available()) {
         size_t n = f.read(buf, sizeof(buf));
         if (Update.write(buf, n) != n) {
-            Serial.println("[OTA] Write failed");
             Update.abort();
             f.close(); SD.remove(UPDATE_FILE);
             return false;
@@ -560,22 +646,15 @@ static bool checkAndFlashUpdate(){
         display.display();
     }
     f.close();
-    if (!Update.end(true)) {
-        Serial.println("[OTA] Update.end failed");
-        SD.remove(UPDATE_FILE);
-        return false;
-    }
+    if (!Update.end(true)) { SD.remove(UPDATE_FILE); return false; }
     Serial.println("[OTA] Success! Rebooting...");
-    display.clearDisplay();
-    display.setCursor(6, 24); display.print("UPDATE SUCCESS");
-    display.setCursor(6, 38); display.print("Rebooting...");
-    display.display();
     delay(1500);
     SD.remove(UPDATE_FILE);
     ESP.restart();
     return true;
 }
 
+// ─────────────────────── Web handlers ───────────────────────
 static void hLedRoot() { ledServer.send_P(200, "text/html", LED_MUSIC_HTML); }
 static void hLedCmd(){
     if (ledServer.hasArg("effect"))     { WebCmd c(WebCmd::SET_EFFECT, ledServer.arg("effect").toInt());     xQueueSend(cmdQueue, &c, 0); }
@@ -662,10 +741,7 @@ static void hFileDownload(){
     f.close();
 }
 static void hAtkRoot() { ledServer.send_P(200, "text/html", ATTACKS_HTML); }
-static void hAtkScan(){
-    startAsyncScan();
-    ledServer.send(200, "text/plain", "OK");
-}
+static void hAtkScan(){ startAsyncScan(); ledServer.send(200, "text/plain", "OK"); }
 static void hAtkScanResults(){
     String j = "{\"ready\":"; j += (scanReady ? "true" : "false");
     j += ",\"aps\":[";
@@ -713,12 +789,10 @@ static void hFwUpload(){
     if (u.status == UPLOAD_FILE_START) {
         if (!SD.exists("/update")) SD.mkdir("/update");
         fwF = SD.open(UPDATE_FILE, FILE_WRITE);
-        Serial.printf("[WEB-OTA] Receiving %s\n", u.filename.c_str());
     } else if (u.status == UPLOAD_FILE_WRITE) {
         if (fwF) fwF.write(u.buf, u.currentSize);
     } else if (u.status == UPLOAD_FILE_END) {
         if (fwF) fwF.close();
-        Serial.printf("[WEB-OTA] Saved %u bytes\n", u.totalSize);
     }
 }
 static void hFwUploadDone(){ ledServer.send(200, "text/plain", "OK"); }
@@ -759,6 +833,66 @@ static void stopWeb(){
     webRunning = false;
 }
 
+// ─────────────────────── Display helpers ───────────────────────
+static void wakeDisplay(){
+    lastActivity = millis();
+    if (displayOff) { displayOff = false; display.ssd1306_command(SSD1306_DISPLAYON); }
+}
+static void checkSleep(){
+    if (!g.displaySleepEnabled || displayOff) return;
+    if (millis() - lastActivity > 30000) {
+        displayOff = true;
+        display.clearDisplay(); display.display();
+        display.ssd1306_command(SSD1306_DISPLAYOFF);
+    }
+}
+static void drawBatteryDark(int x,int y){
+    display.drawRect(x,y,16,9,BLACK);
+    display.fillRect(x+16,y+3,2,3,BLACK);
+    int f=(g.batteryPct*12)/100;
+    if(f>0) display.fillRect(x+2,y+2,f,5,BLACK);
+}
+static void drawBatteryLight(int x,int y){
+    display.drawRect(x,y,16,9,WHITE);
+    display.fillRect(x+16,y+3,2,3,WHITE);
+    int f=(g.batteryPct*12)/100;
+    if(f>0) display.fillRect(x+2,y+2,f,5,WHITE);
+}
+static void hdr(const char* t){
+    display.fillRect(0,0,SCR_W,13,WHITE);
+    display.setTextColor(BLACK);
+    display.setTextSize(1);
+    display.setCursor(4,3);
+    display.print(t);
+    drawBatteryDark(SCR_W-22,2);
+    display.setTextColor(WHITE);
+}
+static void hdrL(const char* t){
+    display.drawFastHLine(0,0,SCR_W,WHITE);
+    display.setTextColor(WHITE);
+    display.setTextSize(1);
+    display.setCursor(4,5);
+    display.print(t);
+    drawBatteryLight(SCR_W-22,4);
+}
+
+// Icons
+static void iPlay(int x,int y,uint16_t c){display.fillTriangle(x+2,y+1,x+2,y+7,x+7,y+4,c);}
+static void iMusic(int x,int y,uint16_t c){display.fillCircle(x+2,y+5,2,c);display.drawFastVLine(x+3,y+1,5,c);display.drawPixel(x+4,y+1,c);display.drawPixel(x+5,y+1,c);display.drawPixel(x+6,y+2,c);display.drawPixel(x+6,y+3,c);display.drawPixel(x+5,y+3,c);}
+static void iBT(int x,int y,uint16_t c){display.drawFastVLine(x+4,y,8,c);display.drawLine(x+4,y,x+6,y+2,c);display.drawLine(x+6,y+2,x+2,y+4,c);display.drawLine(x+4,y+7,x+6,y+5,c);display.drawLine(x+6,y+5,x+2,y+3,c);}
+static void iGame(int x,int y,uint16_t c){display.drawRect(x,y+1,8,6,c);display.drawPixel(x+2,y+3,c);display.drawPixel(x+1,y+4,c);display.drawPixel(x+2,y+4,c);display.drawPixel(x+3,y+4,c);display.drawPixel(x+2,y+5,c);display.drawPixel(x+5,y+3,c);display.drawPixel(x+5,y+5,c);}
+static void iLED(int x,int y,uint16_t c){display.drawCircle(x+4,y+3,3,c);display.fillRect(x+3,y+6,3,2,c);display.drawPixel(x+4,y+3,c);}
+static void iFlash(int x,int y,uint16_t c){display.fillRect(x+2,y,4,3,c);display.fillRect(x+3,y+3,2,5,c);display.drawPixel(x,y,c);display.drawPixel(x+7,y,c);}
+static void iWifi(int x,int y,uint16_t c){display.drawPixel(x+2,y,c);display.drawPixel(x+3,y,c);display.drawPixel(x+4,y,c);display.drawPixel(x+5,y,c);display.drawPixel(x+1,y+1,c);display.drawPixel(x+6,y+1,c);display.drawPixel(x,y+2,c);display.drawPixel(x+7,y+2,c);display.drawPixel(x+2,y+3,c);display.drawPixel(x+3,y+3,c);display.drawPixel(x+4,y+3,c);display.drawPixel(x+5,y+3,c);display.drawPixel(x+1,y+4,c);display.drawPixel(x+6,y+4,c);display.drawPixel(x+3,y+5,c);display.drawPixel(x+4,y+5,c);display.fillRect(x+3,y+6,2,2,c);}
+
+static void iPlayL(int x,int y,uint16_t c){display.fillTriangle(x+4,y+2,x+4,y+14,x+14,y+8,c);}
+static void iMusicL(int x,int y,uint16_t c){display.fillCircle(x+4,y+11,3,c);display.fillCircle(x+11,y+9,3,c);display.drawFastVLine(x+6,y+3,8,c);display.drawFastVLine(x+13,y+1,8,c);display.drawFastHLine(x+6,y+1,8,c);display.drawFastHLine(x+6,y+2,8,c);}
+static void iBTL(int x,int y,uint16_t c){display.drawFastVLine(x+8,y,16,c);display.drawLine(x+8,y,x+14,y+4,c);display.drawLine(x+14,y+4,x+2,y+11,c);display.drawLine(x+8,y+15,x+14,y+11,c);display.drawLine(x+14,y+11,x+2,y+4,c);}
+static void iGameL(int x,int y,uint16_t c){display.drawRoundRect(x,y+2,16,12,4,c);display.drawPixel(x+3,y+7,c);display.drawPixel(x+5,y+7,c);display.drawPixel(x+4,y+6,c);display.drawPixel(x+4,y+8,c);display.fillCircle(x+12,y+8,2,c);display.fillCircle(x+12,y+5,2,c);}
+static void iLEDL(int x,int y,uint16_t c){display.drawCircle(x+8,y+6,5,c);display.fillRect(x+6,y+12,5,4,c);display.drawPixel(x+8,y+6,c);display.drawPixel(x+6,y+5,c);display.drawPixel(x+10,y+5,c);}
+static void iFlashL(int x,int y,uint16_t c){display.fillRect(x+5,y,6,5,c);display.fillRect(x+6,y+5,4,11,c);display.drawLine(x,y,x+3,y+3,c);display.drawLine(x+15,y,x+12,y+3,c);}
+
+// ─────────────────────── Screens ───────────────────────
 static void sBoot(){
     static int step = 0; static unsigned long lastMs = 0; static int w = 0;
     const char* n = "SOUMYA"; unsigned long now = millis();
@@ -889,6 +1023,7 @@ static void sBtMenu(){
     display.setTextColor(WHITE); display.display();
 }
 
+// ─────────────────────── BT SCAN (v9.1 style) ───────────────────────
 static void sBtScan(){
     display.clearDisplay(); hdrL("SCANNING");
     int cx = SCR_W/2, cy = 34;
@@ -897,8 +1032,137 @@ static void sBtScan(){
         if (r < 4) continue;
         uint16_t c = (r < 15) ? WHITE : (r < 30) ? 0x7BEF : 0x39E7;
         display.drawCircle(cx, cy, r, c);
+        if (r > 8) display.drawCircle(cx, cy, r-1, c);
     }
     display.fillCircle(cx, cy, 3, WHITE);
+    float ang = animFrame * 0.12f;
+    for (int len = 6; len < 40; len += 2) {
+        int sx = cx + (int)(cosf(ang) * len);
+        int sy = cy + (int)(sinf(ang) * len);
+        if (sx >= 0 && sx < SCR_W && sy >= 20 && sy < 56) {
+            display.drawPixel(sx, sy, WHITE);
+            if (len < 25) display.drawPixel(sx-1, sy, 0x7BEF);
+        }
+    }
+    // Blips for found devices
+    for (int i = 0; i < btDevCount; i++) {
+        uint16_t s = i * 7919 + 100;
+        int a = (s * 13) % 360;
+        int r = 12 + ((s * 5) % 25);
+        float rad = a * 3.14159f / 180.0f;
+        int bx = cx + (int)(cosf(rad) * r);
+        int by = cy + (int)(sinf(rad) * r);
+        if (bx >= 0 && bx < SCR_W && by >= 20 && by < 56)
+            if ((animFrame + i*5) % 12 < 8) {
+                display.fillCircle(bx, by, 2, WHITE);
+                display.drawCircle(bx, by, 3, 0x39E7);
+            }
+    }
+    display.setTextSize(1); display.setTextColor(WHITE);
+    display.setCursor(4, 4); display.print("SEARCHING");
+    for (int i = 0; i < 4; i++) {
+        int barH = 2 + i * 2;
+        int x = SCR_W - 30 + i * 5;
+        int y = 12 - barH;
+        if ((animFrame/3) % 5 > i) display.fillRect(x, y, 3, barH, WHITE);
+        else display.drawRect(x, y, 3, barH, 0x39E7);
+    }
+    display.setCursor(SCR_W - 26, 4); display.print(btDevCount);
+    display.setCursor(4, 57);
+    if (btScanning) {
+        int dots = (animFrame/4) % 4;
+        display.print("Scanning");
+        for (int i = 0; i < dots; i++) display.print(".");
+    } else {
+        display.print(btDevCount > 0 ? "SEL: view" : "No devices");
+    }
+    display.display();
+}
+
+static void sBtDev(){
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setTextColor(WHITE);
+    display.setCursor(4, 4);
+    char hb[24]; snprintf(hb, sizeof(hb), "Devices %d/%d", btSel + 1, btDevCount);
+    display.print(hb);
+    int start = (btSel > 2) ? (btSel - 2) : 0;
+    int y = 18;
+    for (int i = start; i < btDevCount && y < 60; i++, y += 12) {
+        bool s = (i == btSel);
+        if (s) display.fillRect(0, y-1, SCR_W, 12, WHITE);
+        display.setTextColor(s ? BLACK : WHITE);
+        display.setCursor(2, y+1);
+        char b[20]; snprintf(b, sizeof(b), "%.16s", btDevs[i].name);
+        display.print(b);
+        display.setCursor(SCR_W - 26, y+1);
+        char r[6]; snprintf(r, sizeof(r), "%d", btDevs[i].rssi);
+        display.print(r);
+    }
+    display.display();
+}
+
+static void sBtConn(){
+    display.clearDisplay();
+    int cx = SCR_W/2, cy = 32, hexR = 20;
+    float elapsed = (millis() - btConnectStart) / 1000.0f;
+    float t = elapsed / 4.0f; if (t > 1.0f) t = 1.0f;
+    float eased = t - 1.0f; eased = eased*eased*eased + 1.0f;
+    int prog = (int)roundf(eased * 100.0f);
+
+    // Hexagon
+    float angleStep = 6.2832f / 6.0f;
+    for (int i = 0; i < 6; i++) {
+        float a1 = i * angleStep - 1.5708f;
+        float a2 = (i + 1) * angleStep - 1.5708f;
+        int x1 = cx + (int)(cosf(a1) * hexR);
+        int y1 = cy + (int)(sinf(a1) * hexR);
+        int x2 = cx + (int)(cosf(a2) * hexR);
+        int y2 = cy + (int)(sinf(a2) * hexR);
+        display.drawLine(x1, y1, x2, y2, 0x39E7);
+    }
+    float totalAngle = (prog / 100.0f) * 6.2832f;
+    for (float a = -1.5708f; a < -1.5708f + totalAngle; a += 0.08f) {
+        int px = cx + (int)(cosf(a) * (hexR + 4));
+        int py = cy + (int)(sinf(a) * (hexR + 4));
+        display.drawPixel(px, py, WHITE);
+        display.drawPixel(px + 1, py, WHITE);
+    }
+    display.drawCircle(cx, cy, hexR + 4, 0x18E3);
+
+    if (a2dpConnected) {
+        display.drawLine(cx - 8, cy, cx - 3, cy + 5, WHITE);
+        display.drawLine(cx - 7, cy, cx - 3, cy + 4, WHITE);
+        display.drawLine(cx - 3, cy + 5, cx + 8, cy - 6, WHITE);
+        display.drawLine(cx - 3, cy + 4, cx + 7, cy - 6, WHITE);
+    } else {
+        int bx = cx - 4, by = cy - 4;
+        display.drawFastVLine(bx + 4, by, 8, WHITE);
+        display.drawLine(bx + 4, by, bx + 6, by + 2, WHITE);
+        display.drawLine(bx + 6, by + 2, bx + 2, by + 4, WHITE);
+        display.drawLine(bx + 4, by + 7, bx + 6, by + 5, WHITE);
+        display.drawLine(bx + 6, by + 5, bx + 2, by + 3, WHITE);
+    }
+
+    display.fillRect(0, 0, SCR_W, 13, BLACK);
+    display.setTextSize(1); display.setTextColor(WHITE);
+    const char* name = (btConnectTarget >= 0 && btConnectTarget < btDevCount)
+                        ? btDevs[btConnectTarget].name : "...";
+    char nb[18]; snprintf(nb, sizeof(nb), "%.20s", name);
+    int nw = strlen(nb) * 6;
+    display.setCursor((SCR_W - nw) / 2, 4); display.print(nb);
+
+    char pbuf[8]; snprintf(pbuf, sizeof(pbuf), "%d%%", prog);
+    display.setCursor(4, 57); display.print(pbuf);
+
+    const char* st = a2dpStreaming ? "STREAMING" :
+                     (a2dpConnected ? "CONNECTED" : "CONNECTING");
+    int sw = strlen(st) * 6;
+    display.setCursor(SCR_W - sw - 4, 57); display.print(st);
+
+    if (a2dpConnected && elapsed > 5.0f) {
+        g.mode = M_BT_MENU; g.subSel = 0; btConnectTarget = -1;
+    }
     display.display();
 }
 
@@ -1031,7 +1295,7 @@ static void sSettings(){
 static void sInfo(){
     display.clearDisplay(); hdrL("DEVICE INFO");
     display.setTextSize(1); display.setTextColor(WHITE);
-    display.setCursor(4, 18); display.print("SOUMYA Gadget v9.1");
+    display.setCursor(4, 18); display.print("SOUMYA Gadget v9.2");
     display.setCursor(4, 28); display.print("ESP32-WROOM-32");
     char u[24]; snprintf(u, sizeof(u), "Up: %lu min", millis()/60000UL);
     display.setCursor(4, 38); display.print(u);
@@ -1138,7 +1402,15 @@ static void drawCurrent(){
         case M_SONGS: sSongs(); break;
         case M_PLAYER: sPlayer(); break;
         case M_BT_MENU: sBtMenu(); break;
-        case M_BT_SCAN: sBtScan(); break;
+        case M_BT_SCAN:
+            if (btScanning) sBtScan();
+            else if (btConnectTarget >= 0 && (millis() - btConnectStart) < 8000 && !a2dpConnected)
+                sBtConn();
+            else if (a2dpConnected && (millis() - btConnectStart) < 12000)
+                sBtConn();
+            else if (btDevCount > 0) sBtDev();
+            else sBtScan();
+            break;
         case M_LED_MENU: sLedMenu(); break;
         case M_LED_FX: sLedFx(); break;
         case M_LED_BRIGHT: sLedBright(); break;
@@ -1159,6 +1431,7 @@ static void drawCurrent(){
     }
 }
 
+// ─────────────────────── Menu handlers ───────────────────────
 static void onMain(int ev){
     if (ev == 0) g.mainSel = (g.mainSel - 1 + 6) % 6;
     else if (ev == 1) g.mainSel = (g.mainSel + 1) % 6;
@@ -1191,7 +1464,12 @@ static void onPlayer(int ev){
 static void onBtMenu(int ev){
     if (ev == 0) g.subSel = (g.subSel - 1 + 3) % 3;
     else if (ev == 1) g.subSel = (g.subSel + 1) % 3;
-    else if (ev == 2 && g.subSel == 0) g.mode = M_BT_SCAN;
+    else if (ev == 2 && g.subSel == 0) {
+        g.mode = M_BT_SCAN;
+        btSel = 0;
+        btConnectTarget = -1;
+        startBtDiscovery();
+    }
     else if (ev == 3) { g.mode = M_MAIN; g.mainSel = 2; }
 }
 static void onLedMenu(int ev){
@@ -1210,8 +1488,8 @@ static void onLedFx(int ev){
     else if (ev == 3) { g.mode = M_LED_MENU; g.subSel = 0; }
 }
 static void onLedBright(int ev){
-    if (ev == 0) { g.ledBright = min(g.ledBright + 15, 255); }
-    else if (ev == 1) { g.ledBright = max(g.ledBright - 15, 0); }
+    if (ev == 0) g.ledBright = min(g.ledBright + 15, 255);
+    else if (ev == 1) g.ledBright = max(g.ledBright - 15, 0);
     else if (ev == 3) { g.mode = M_LED_MENU; g.subSel = 2; }
 }
 static void onLedWifi(int ev){
@@ -1282,6 +1560,7 @@ static int pollButtons(){
     return -1;
 }
 
+// ─────────────────────── Tasks ───────────────────────
 static void webTask(void*){
     for (;;) {
         if (webRunning) ledServer.handleClient();
@@ -1326,6 +1605,18 @@ static void uiTask(void*){
                 case M_SONGS: onSongs(ev); break;
                 case M_PLAYER: onPlayer(ev); break;
                 case M_BT_MENU: onBtMenu(ev); break;
+                case M_BT_SCAN:
+                    if (btScanning) {
+                        if (ev == 2 || ev == 3) stopBtDiscovery();
+                    } else if (btConnectTarget >= 0 && !a2dpConnected && (millis() - btConnectStart) < 8000) {
+                        // connect animation — ignore
+                    } else {
+                        if (ev == 0 && btSel > 0) btSel--;
+                        else if (ev == 1 && btSel < btDevCount - 1) btSel++;
+                        else if (ev == 2 && btDevCount > 0) btConnect(btSel);
+                        else if (ev == 3) { g.mode = M_BT_MENU; g.subSel = 0; btConnectTarget = -1; }
+                    }
+                    break;
                 case M_LED_MENU: onLedMenu(ev); break;
                 case M_LED_FX: onLedFx(ev); break;
                 case M_LED_BRIGHT: onLedBright(ev); break;
@@ -1341,7 +1632,6 @@ static void uiTask(void*){
                 case M_ATTACK_RUN: onAttack(ev); break;
                 case M_IR_LEARN: case M_IR_TX: case M_IR_JAM:
                     if (ev == 3) { g.mode = M_IR_MENU; g.subSel = 0; } break;
-                case M_BT_SCAN: if (ev == 3) { g.mode = M_BT_MENU; g.subSel = 0; } break;
                 case M_GAMES: onGames(ev); break;
                 default: if (ev == 3) g.mode = M_MAIN; break;
             }
@@ -1365,10 +1655,11 @@ static void audioTask(void*){
     }
 }
 
+// ─────────────────────── Setup ───────────────────────
 void setup(){
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== SOUMYA Gadget v9.1 ===");
+    Serial.println("\n=== SOUMYA Gadget v9.2 ===");
 
     cmdQueue = xQueueCreate(16, sizeof(WebCmd));
 
@@ -1409,8 +1700,12 @@ void loop(){
             else if (cmdBuf == "down" || cmdBuf == "d") gSerialEv = 1;
             else if (cmdBuf == "sel"  || cmdBuf == "s") gSerialEv = 2;
             else if (cmdBuf == "back" || cmdBuf == "b") gSerialEv = 3;
+            else if (cmdBuf == "hid"  || cmdBuf == "hidden") {
+                g.mode = M_HIDDEN; g.subSel = 0;
+                Serial.println(">> HIDDEN menu");
+            }
             else if (cmdBuf == "help" || cmdBuf == "?") {
-                Serial.println("\n up/u  down/d  sel/s  back/b\n");
+                Serial.println("\n up/u  down/d  sel/s  back/b  hid  help\n");
             }
             cmdBuf = "";
         } else cmdBuf += c;
