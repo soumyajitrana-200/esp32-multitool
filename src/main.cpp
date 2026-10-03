@@ -118,13 +118,17 @@ static bool displayOff = false;
 static int animFrame = 0;
 static volatile int gSerialEv = -1;
 
+// WebCmd with proper constructors
 struct WebCmd {
     enum T : uint8_t {
         NONE, PLAY, NEXT, PREV, STOP,
         SET_EFFECT, SET_BRIGHT, SET_COUNT, SET_HUE,
         ATK_BEACON, ATK_PROBE, ATK_DEAUTH, ATK_STOP
-    } type = NONE;
-    int arg = 0;
+    };
+    T type;
+    int arg;
+    WebCmd() : type(NONE), arg(0) {}
+    WebCmd(T t, int a = 0) : type(t), arg(a) {}
 };
 static QueueHandle_t cmdQueue = nullptr;
 
@@ -574,21 +578,19 @@ static bool checkAndFlashUpdate(){
 
 static void hLedRoot() { ledServer.send_P(200, "text/html", LED_MUSIC_HTML); }
 static void hLedCmd(){
-    if (ledServer.hasArg("effect"))     { WebCmd c{WebCmd::SET_EFFECT, ledServer.arg("effect").toInt()};     xQueueSend(cmdQueue, &c, 0); }
-    if (ledServer.hasArg("brightness")) { WebCmd c{WebCmd::SET_BRIGHT, ledServer.arg("brightness").toInt()}; xQueueSend(cmdQueue, &c, 0); }
-    if (ledServer.hasArg("count"))      { WebCmd c{WebCmd::SET_COUNT,  ledServer.arg("count").toInt()};      xQueueSend(cmdQueue, &c, 0); }
-    if (ledServer.hasArg("hue"))        { WebCmd c{WebCmd::SET_HUE,    ledServer.arg("hue").toInt()};        xQueueSend(cmdQueue, &c, 0); }
+    if (ledServer.hasArg("effect"))     { WebCmd c(WebCmd::SET_EFFECT, ledServer.arg("effect").toInt());     xQueueSend(cmdQueue, &c, 0); }
+    if (ledServer.hasArg("brightness")) { WebCmd c(WebCmd::SET_BRIGHT, ledServer.arg("brightness").toInt()); xQueueSend(cmdQueue, &c, 0); }
+    if (ledServer.hasArg("count"))      { WebCmd c(WebCmd::SET_COUNT,  ledServer.arg("count").toInt());      xQueueSend(cmdQueue, &c, 0); }
+    if (ledServer.hasArg("hue"))        { WebCmd c(WebCmd::SET_HUE,    ledServer.arg("hue").toInt());        xQueueSend(cmdQueue, &c, 0); }
     ledServer.send(200, "text/plain", "OK");
 }
 static void hMusicCmd(){
     String a = ledServer.arg("action");
-    WebCmd c;
-    if      (a == "play") { c.type = WebCmd::PLAY; c.arg = ledServer.arg("idx").toInt(); }
-    else if (a == "next") { c.type = WebCmd::NEXT; }
-    else if (a == "prev") { c.type = WebCmd::PREV; }
-    else if (a == "stop") { c.type = WebCmd::STOP; }
+    if      (a == "play") { WebCmd c(WebCmd::PLAY, ledServer.arg("idx").toInt()); xQueueSend(cmdQueue, &c, 0); }
+    else if (a == "next") { WebCmd c(WebCmd::NEXT); xQueueSend(cmdQueue, &c, 0); }
+    else if (a == "prev") { WebCmd c(WebCmd::PREV); xQueueSend(cmdQueue, &c, 0); }
+    else if (a == "stop") { WebCmd c(WebCmd::STOP); xQueueSend(cmdQueue, &c, 0); }
     else { ledServer.send(400, "text/plain", "bad"); return; }
-    xQueueSend(cmdQueue, &c, 0);
     ledServer.send(200, "text/plain", "OK");
 }
 static void hMusicList(){
@@ -684,13 +686,11 @@ static void hAtkScanResults(){
 }
 static void hAtkCmd(){
     String c = ledServer.arg("cmd");
-    WebCmd wc;
-    if      (c == "beacon") wc.type = WebCmd::ATK_BEACON;
-    else if (c == "probe")  wc.type = WebCmd::ATK_PROBE;
-    else if (c == "stop")   wc.type = WebCmd::ATK_STOP;
-    else if (c == "deauth") { wc.type = WebCmd::ATK_DEAUTH; wc.arg = ledServer.arg("idx").toInt(); }
+    if      (c == "beacon") { WebCmd wc(WebCmd::ATK_BEACON); xQueueSend(cmdQueue, &wc, 0); }
+    else if (c == "probe")  { WebCmd wc(WebCmd::ATK_PROBE);  xQueueSend(cmdQueue, &wc, 0); }
+    else if (c == "stop")   { WebCmd wc(WebCmd::ATK_STOP);   xQueueSend(cmdQueue, &wc, 0); }
+    else if (c == "deauth") { WebCmd wc(WebCmd::ATK_DEAUTH, ledServer.arg("idx").toInt()); xQueueSend(cmdQueue, &wc, 0); }
     else { ledServer.send(400, "text/plain", "bad"); return; }
-    xQueueSend(cmdQueue, &wc, 0);
     ledServer.send(200, "text/plain", "OK");
 }
 static void hAtkStatus(){
@@ -721,9 +721,7 @@ static void hFwUpload(){
         Serial.printf("[WEB-OTA] Saved %u bytes\n", u.totalSize);
     }
 }
-static void hFwUploadDone(){
-    ledServer.send(200, "text/plain", "OK");
-}
+static void hFwUploadDone(){ ledServer.send(200, "text/plain", "OK"); }
 static void hFwReboot(){
     ledServer.send(200, "text/plain", "Rebooting...");
     delay(300);
