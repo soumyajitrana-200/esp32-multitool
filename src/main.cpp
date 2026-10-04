@@ -1,5 +1,6 @@
 // ============================================================
-//  SOUMYA Gadget v9.2 — Complete Merged Build
+//  SOUMYA Gadget v9.3 — with OLED Studio
+//  Animation video -> 1-bit frames -> SD card -> OLED sync
 // ============================================================
 
 #include <Arduino.h>
@@ -31,6 +32,7 @@ extern "C" {
 #include "led_music_ui.h"
 #include "file_ui.h"
 #include "attacks_ui.h"
+#include "anim_studio.h"
 
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return 0; }
 
@@ -53,12 +55,13 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return
 #define AP_CHANNEL 6
 #define BT_NAME "SOUMYA-Music"
 #define MUSIC_DIR "/music"
+#define ANIM_DIR  "/anims"
 #define RING_SIZE 8192
 #define MAX_SONGS 32
 #define UPDATE_FILE "/update/firmware.bin"
 
 enum Mode : uint8_t {
-    M_BOOT, M_MAIN, M_SONGS, M_PLAYER,
+    M_BOOT, M_MAIN, M_SONGS, M_PLAYER, M_PLAYER_ANIM,
     M_BT_MENU, M_BT_SCAN, M_BT_DEV,
     M_GAMES,
     M_LED_MENU, M_LED_FX, M_LED_MUS, M_LED_BRIGHT, M_LED_WIFI,
@@ -128,6 +131,17 @@ static unsigned long lastActivity = 0;
 static bool displayOff = false;
 static int animFrame = 0;
 static volatile int gSerialEv = -1;
+
+// ═══ Animation player state ═══
+static File    animFile;
+static uint16_t animW = 128, animH = 64;
+static uint16_t animFps = 15;
+static uint32_t animFrames = 0;
+static uint32_t animCurrentFrame = 0;
+static unsigned long animStartMs = 0;
+static unsigned long animLastFrameMs = 0;
+static bool animActive = false;
+static char animPath[64] = {0};
 
 struct WebCmd {
     enum T : uint8_t {
@@ -222,7 +236,7 @@ static void a2d_conn_cb(esp_a2d_cb_event_t event, esp_a2d_cb_param_t* param) {
             uint8_t st = param->audio_stat.state;
             if (st == ESP_A2D_AUDIO_STATE_STARTED) {
                 a2dpStreaming = true;
-                Serial.println("[A2DP] ★ STREAM STARTED ★");
+                Serial.println("[A2DP] * STREAM STARTED *");
             } else if (st == ESP_A2D_AUDIO_STATE_STOPPED) {
                 a2dpStreaming = false;
                 Serial.println("[A2DP] Audio STOPPED");
@@ -329,6 +343,83 @@ void ensureBT(){
     Serial.println("[BT] Stack ready");
 }
 
+// ═══ Animation player functions ═══
+static bool animOpen(const char* path){
+    if (animFile) animFile.close();
+    animFile = SD.open(path, FILE_READ);
+    if (!animFile) return false;
+    uint8_t hdr[16];
+    if (animFile.read(hdr, 16) != 16) { animFile.close(); return false; }
+    if (hdr[0] != 'A' || hdr[1] != 'N' || hdr[2] != 'I' || hdr[3] != 'M') {
+        animFile.close(); return false;
+    }
+    animW = hdr[4] | (hdr[5] << 8);
+    animH = hdr[6] | (hdr[7] << 8);
+    animFps = hdr[8] | (hdr[9] << 8);
+    animFrames = hdr[10] | (hdr[11]<<8) | (hdr[12]<<16) | ((uint32_t)hdr[13]<<24);
+    animCurrentFrame = 0;
+    animStartMs = millis();
+    animLastFrameMs = 0;
+    animActive = true;
+    strncpy(animPath, path, 63);
+    Serial.printf("[ANIM] Opened %s  %dx%d @ %dfps  %u frames\n",
+                  path, animW, animH, animFps, animFrames);
+    return true;
+}
+
+static void animClose(){
+    if (animFile) animFile.close();
+    animActive = false;
+    animPath[0] = 0;
+}
+
+static void animDrawFrame(uint32_t idx){
+    if (!animFile || !animActive) return;
+    if (idx >= animFrames) return;
+    // Seek to frame
+    uint32_t offset = 16 + idx * ((animW / 8) * animH);
+    if (!animFile.seek(offset)) return;
+
+    int bytesPerRow = animW / 8;
+    uint8_t rowBuf[16];
+    display.clearDisplay();
+    for (int y = 0; y < animH && y < SCR_H; y++){
+        if (animFile.read(rowBuf, bytesPerRow) != bytesPerRow) break;
+        for (int x = 0; x < animW && x < SCR_W; x++){
+            int byteIdx = x >> 3;
+            int bit = 7 - (x & 7);
+            if (rowBuf[byteIdx] & (1 << bit))
+                display.drawPixel(x, y, WHITE);
+        }
+    }
+}
+
+static void animTick(){
+    if (!animActive) return;
+    unsigned long elapsed = millis() - animStartMs;
+    uint32_t shouldBe = (elapsed * animFps) / 1000;
+    if (shouldBe >= animFrames) {
+        animClose();
+        return;
+    }
+    // Only redraw if frame changed (avoid needless I2C)
+    if (shouldBe != animCurrentFrame){
+        animCurrentFrame = shouldBe;
+        animDrawFrame(animCurrentFrame);
+        display.display();
+    }
+}
+
+// Find matching .anim for a song basename
+static bool findAnimForSong(int songIdx){
+    if (songIdx < 0 || songIdx >= songCount) return false;
+    String sn = songName(songIdx);       // e.g. "Kesariya.mp3"
+    int dot = sn.lastIndexOf('.');
+    if (dot > 0) sn = sn.substring(0, dot);
+    String p = String(ANIM_DIR) + "/" + sn + ".anim";
+    return animOpen(p.c_str());
+}
+
 void stopSong(){
     if (audioMP3 && audioMP3->isRunning()) audioMP3->stop();
     if (audioSrc) audioSrc->close();
@@ -336,6 +427,7 @@ void stopSong(){
     delete audioSrc;  audioSrc  = nullptr;
     g.isPlaying = false;
     rbHead = rbTail = 0;
+    animClose();
 }
 void playSong(int idx){
     if (idx < 0 || idx >= songCount) return;
@@ -346,8 +438,17 @@ void playSong(int idx){
     if (!audioSrc) return;
     audioMP3 = new AudioGeneratorMP3();
     if (!audioMP3) { delete audioSrc; audioSrc = nullptr; return; }
-    if (audioMP3->begin(audioSrc, audioRB)) g.isPlaying = true;
-    else stopSong();
+    if (audioMP3->begin(audioSrc, audioRB)) {
+        g.isPlaying = true;
+        // Try to load matching animation
+        if (findAnimForSong(idx)) {
+            g.mode = M_PLAYER_ANIM;
+        } else {
+            g.mode = M_PLAYER;
+        }
+    } else {
+        stopSong();
+    }
 }
 void nextSong(){ if (songCount) playSong((g.currentSong + 1) % songCount); }
 void prevSong(){ if (songCount) playSong((g.currentSong - 1 + songCount) % songCount); }
@@ -632,6 +733,9 @@ static bool checkAndFlashUpdate(){
     return true;
 }
 
+// ═══════════════════════════════════════════════════════════
+//  Web handlers
+// ═══════════════════════════════════════════════════════════
 static void hLedRoot() { ledServer.send_P(200, "text/html", LED_MUSIC_HTML); }
 static void hLedCmd(){
     if (ledServer.hasArg("effect"))     { WebCmd c(WebCmd::SET_EFFECT, ledServer.arg("effect").toInt());     xQueueSend(cmdQueue, &c, 0); }
@@ -778,6 +882,64 @@ static void hFwReboot(){
     delay(300);
     ESP.restart();
 }
+
+// ═══════════════════════════════════════════════════════════
+//  ANIMATION UPLOAD / LIST / DELETE
+// ═══════════════════════════════════════════════════════════
+static File animUpF;
+
+static void hAnimStudio() {
+    ledServer.send_P(200, "text/html", ANIM_STUDIO_HTML);
+}
+
+static void hAnimUpload() {
+    HTTPUpload& u = ledServer.upload();
+    if (u.status == UPLOAD_FILE_START) {
+        if (!SD.exists(ANIM_DIR)) SD.mkdir(ANIM_DIR);
+        String path = String(ANIM_DIR) + "/" + u.filename;
+        animUpF = SD.open(path.c_str(), FILE_WRITE);
+        Serial.printf("[ANIM] Receiving %s\n", u.filename.c_str());
+    } else if (u.status == UPLOAD_FILE_WRITE) {
+        if (animUpF) animUpF.write(u.buf, u.currentSize);
+    } else if (u.status == UPLOAD_FILE_END) {
+        if (animUpF) animUpF.close();
+        Serial.printf("[ANIM] Saved %u bytes\n", u.totalSize);
+    }
+}
+
+static void hAnimUploadDone() {
+    ledServer.send(200, "text/plain", "OK");
+}
+
+static void hAnimList() {
+    String j = "{\"anims\":[";
+    File dir = SD.open(ANIM_DIR, FILE_READ);
+    bool first = true;
+    if (dir) {
+        File f = dir.openNextFile();
+        while (f) {
+            if (!f.isDirectory()) {
+                if (!first) j += ',';
+                j += "{\"name\":\""; j += String(f.name());
+                j += "\",\"size\":"; j += (uint32_t)f.size(); j += "}";
+                first = false;
+            }
+            f = dir.openNextFile();
+        }
+        dir.close();
+    }
+    j += "]}";
+    ledServer.send(200, "application/json", j);
+}
+
+static void hAnimDelete() {
+    String n = ledServer.arg("name");
+    if (n.length() == 0) { ledServer.send(400, "text/plain", "no name"); return; }
+    String p = String(ANIM_DIR) + "/" + n;
+    if (SD.remove(p.c_str())) ledServer.send(200, "text/plain", "OK");
+    else ledServer.send(500, "text/plain", "fail");
+}
+
 static void startWeb(){
     if (webRunning) return;
     WiFi.mode(WIFI_AP);
@@ -799,6 +961,10 @@ static void startWeb(){
     ledServer.on("/atk/emergency",      HTTP_POST, hEmergency);
     ledServer.on("/firmware/upload",    HTTP_POST, hFwUploadDone, hFwUpload);
     ledServer.on("/firmware/reboot",    HTTP_POST, hFwReboot);
+    ledServer.on("/anim",               hAnimStudio);
+    ledServer.on("/anim/list",          hAnimList);
+    ledServer.on("/anim/delete",        HTTP_POST, hAnimDelete);
+    ledServer.on("/anim/upload",        HTTP_POST, hAnimUploadDone, hAnimUpload);
     ledServer.begin();
     webRunning = true;
 }
@@ -1266,7 +1432,7 @@ static void sSettings(){
 static void sInfo(){
     display.clearDisplay(); hdrL("DEVICE INFO");
     display.setTextSize(1); display.setTextColor(WHITE);
-    display.setCursor(4, 18); display.print("SOUMYA Gadget v9.2");
+    display.setCursor(4, 18); display.print("SOUMYA Gadget v9.3");
     display.setCursor(4, 28); display.print("ESP32-WROOM-32");
     char u[24]; snprintf(u, sizeof(u), "Up: %lu min", millis()/60000UL);
     display.setCursor(4, 38); display.print(u);
@@ -1367,11 +1533,17 @@ static void sIrJam(){
 }
 
 static void drawCurrent(){
+    // Animation player takes precedence
+    if (g.mode == M_PLAYER_ANIM && animActive) {
+        animTick();
+        return;
+    }
     switch (g.mode) {
         case M_BOOT: sBoot(); break;
         case M_MAIN: sMain(); break;
         case M_SONGS: sSongs(); break;
         case M_PLAYER: sPlayer(); break;
+        case M_PLAYER_ANIM: sPlayer(); break;   // fallback if anim not loaded
         case M_BT_MENU: sBtMenu(); break;
         case M_BT_SCAN:
             if (btScanning) sBtScan();
@@ -1407,7 +1579,7 @@ static void onMain(int ev){
     else if (ev == 1) g.mainSel = (g.mainSel + 1) % 6;
     else if (ev == 2) {
         switch (g.mainSel) {
-            case 0: if (songCount) { playSong(random(0, songCount)); g.mode = M_PLAYER; } break;
+            case 0: if (songCount) { playSong(random(0, songCount)); } break;
             case 1: g.mode = M_SONGS; g.subSel = 0; break;
             case 2: g.mode = M_BT_MENU; g.subSel = 0; break;
             case 3: g.mode = M_GAMES; g.subSel = 0; break;
@@ -1422,14 +1594,14 @@ static void onSongs(int ev){
     else if (ev == 1) g.subSel = (g.subSel + 1) % total;
     else if (ev == 2) {
         if (g.subSel == 0) { g.mode = M_WIFI_FILES; startWeb(); }
-        else { playSong(g.subSel - 1); g.mode = M_PLAYER; }
+        else { playSong(g.subSel - 1); }
     } else if (ev == 3) { g.mode = M_MAIN; g.mainSel = 1; }
 }
 static void onPlayer(int ev){
     if (ev == 0) g.volume = min(g.volume + 5, 100);
     else if (ev == 1) g.volume = max(g.volume - 5, 0);
     else if (ev == 2) { g.isPlaying = !g.isPlaying; }
-    else if (ev == 3) { g.mode = M_SONGS; g.subSel = g.currentSong + 1; }
+    else if (ev == 3) { stopSong(); g.mode = M_SONGS; g.subSel = g.currentSong + 1; }
 }
 static void onBtMenu(int ev){
     if (ev == 0) g.subSel = (g.subSel - 1 + 3) % 3;
@@ -1573,6 +1745,7 @@ static void uiTask(void*){
                 case M_MAIN: onMain(ev); break;
                 case M_SONGS: onSongs(ev); break;
                 case M_PLAYER: onPlayer(ev); break;
+                case M_PLAYER_ANIM: onPlayer(ev); break;
                 case M_BT_MENU: onBtMenu(ev); break;
                 case M_BT_SCAN:
                     if (btScanning) {
@@ -1626,15 +1799,21 @@ static void audioTask(void*){
 void setup(){
     Serial.begin(115200);
     delay(500);
-    Serial.println("\n=== SOUMYA Gadget v9.2 ===");
+    Serial.println("\n=== SOUMYA Gadget v9.3 ===");
 
     cmdQueue = xQueueCreate(16, sizeof(WebCmd));
 
     SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, PIN_SD_CS);
     if (!SD.begin(PIN_SD_CS)) Serial.println("[!] SD FAIL");
-    else { Serial.println("[+] SD OK"); loadSongs(); Serial.printf("[+] %d songs\n", songCount); }
+    else {
+        Serial.println("[+] SD OK");
+        loadSongs();
+        Serial.printf("[+] %d songs\n", songCount);
+        if (!SD.exists(ANIM_DIR)) SD.mkdir(ANIM_DIR);
+    }
 
     Wire.begin(OLED_SDA, OLED_SCL);
+    Wire.setClock(400000);
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
         Serial.println("[!] OLED FAIL");
         while (1) delay(1000);
