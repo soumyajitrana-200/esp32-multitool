@@ -66,7 +66,8 @@ enum Mode : uint8_t {
     M_GAMES,
     M_LED_MENU, M_LED_FX, M_LED_MUS, M_LED_BRIGHT, M_LED_WIFI,
     M_FLASH_MENU, M_SETTINGS, M_INFO, M_WIFI_FILES,
-    M_HIDDEN, M_WIFI_TOOLS, M_BT_TOOLS, M_IR_MENU,
+    M_HIDDEN, M_WIFI_TOOLS, M_WIFI_AP_LIST, M_WIFI_ATK,
+    M_BT_TOOLS, M_IR_MENU,
     M_ATTACK_RUN, M_IR_LEARN, M_IR_TX, M_IR_JAM
 };
 
@@ -1455,27 +1456,144 @@ static void sWifiFiles(){
     display.display();
 }
 
+// ═══════════════════════════════════════════════════════════
+//  Cyber menu (card-stack style)
+// ═══════════════════════════════════════════════════════════
 void drawCyberMenu(int sel, const char* title, const char** items, int count, int sceneID){
-    int rowH = 14, baseY = 18;
-    smTick(sceneID, sel, 0);
-    display.clearDisplay(); hdr(title);
+    const int CARD_W = 112, CARD_H = 14, CARD_STEP = 16, ANCHOR_Y = 26;
+    smTick(sceneID, sel, sel);
+    display.clearDisplay();
+    hdr(title);
+    int x = (SCR_W - CARD_W) / 2;
     for (int idx = 0; idx < count; idx++) {
-        int y = baseY + idx * rowH;
-        bool s = fabsf((float)idx - smSel) < 0.7f;
-        if (s) { display.fillRect(2, y, SCR_W-4, rowH-1, WHITE); display.setTextColor(BLACK);
-                 display.setCursor(6, y+3); display.print("> "); display.print(items[idx]); }
-        else   { display.setTextColor(WHITE); display.setCursor(18, y+3); display.print(items[idx]); }
+        float yf = ANCHOR_Y + (idx - smSel) * CARD_STEP;
+        int y = (int)roundf(yf);
+        if (y + CARD_H < 14) continue;
+        if (y > SCR_H - 6) continue;
+        bool s = fabsf((float)idx - smSel) < 0.5f;
+        int bob = s ? (int)(sinf(animFrame * 0.12f) * 1.0f) : 0;
+        int dy = y + bob;
+        if (s) {
+            display.fillRoundRect(x, dy, CARD_W, CARD_H, 4, WHITE);
+            display.setTextColor(BLACK);
+            display.fillTriangle(x+5, dy+CARD_H/2, x+9, dy+CARD_H/2-3, x+9, dy+CARD_H/2+3, BLACK);
+            display.setCursor(x+15, dy+(CARD_H-8)/2);
+            display.print(items[idx]);
+        } else {
+            display.drawRoundRect(x, dy, CARD_W, CARD_H, 4, WHITE);
+            display.setTextColor(WHITE);
+            display.setCursor(x+15, dy+(CARD_H-8)/2);
+            display.print(items[idx]);
+        }
     }
     display.display();
 }
+
 const char* HID_M[] = {"WiFi Tools","BT Tools","IR Remote"};
 static void sHidden(){ drawCyberMenu(g.subSel, "SYS.ADMIN", HID_M, 3, M_HIDDEN); }
-const char* WT_M[] = {"Scan Networks","Beacon Spam","Deauth Attack","Probe Flood"};
-static void sWifiT(){ drawCyberMenu(g.subSel, "WIFI_OPS", WT_M, 4, M_WIFI_TOOLS); }
 const char* BT_T[] = {"BLE Scan","Classic Scan","BLE Spam"};
 static void sBtT(){ drawCyberMenu(g.subSel, "BT_OPS", BT_T, 3, M_BT_TOOLS); }
 const char* IR_M[] = {"Learn Code","Transmit Code","IR Jammer"};
 static void sIrM(){ drawCyberMenu(g.subSel, "IR_OPS", IR_M, 3, M_IR_MENU); }
+
+// ═══════════════════════════════════════════════════════════
+//  WiFi AP List (radar scan + list)
+// ═══════════════════════════════════════════════════════════
+static void sWifiApList(){
+    display.clearDisplay();
+    display.fillRect(0, 0, SCR_W, 13, WHITE);
+    display.setTextColor(BLACK);
+    display.setTextSize(1);
+    display.setCursor(4, 3);
+    if (scanInProgress) {
+        display.print("SCANNING");
+        display.setCursor(SCR_W - 22, 3);
+        display.print((animFrame % 4 < 2) ? "..." : "   ");
+    } else {
+        char t[18]; snprintf(t, sizeof(t), "FOUND %d APs", apCount);
+        display.print(t);
+    }
+    drawBatteryDark(SCR_W-22, 2);
+
+    if (!scanReady || apCount == 0) {
+        int cx = SCR_W/2, cy = 36;
+        for (int ring = 0; ring < 3; ring++) {
+            int r = ((animFrame * 2) + ring * 15) % 40;
+            if (r < 4) continue;
+            uint16_t c = (r < 15) ? WHITE : (r < 28) ? 0x7BEF : 0x39E7;
+            display.drawCircle(cx, cy, r, c);
+        }
+        display.fillCircle(cx, cy, 3, WHITE);
+        float ang = animFrame * 0.12f;
+        for (int len = 6; len < 34; len += 2) {
+            int sx = cx + (int)(cosf(ang) * len);
+            int sy = cy + (int)(sinf(ang) * len);
+            if (sy >= 16 && sy < 54) {
+                display.drawPixel(sx, sy, WHITE);
+                if (len < 20) display.drawPixel(sx-1, sy, 0x7BEF);
+            }
+        }
+        display.setTextSize(1);
+        display.setTextColor(WHITE);
+        display.setCursor(4, 57);
+        display.print("Please wait...");
+        display.display();
+        return;
+    }
+
+    smTick(M_WIFI_AP_LIST, g.subSel, 0);
+    int rowH = 10, baseY = 15;
+    for (int i = 0; i < apCount && i < 5; i++) {
+        int y = baseY + i * rowH;
+        bool s = (i == g.subSel);
+        if (s) { display.fillRect(0, y, SCR_W, rowH-1, WHITE); display.setTextColor(BLACK); }
+        else display.setTextColor(WHITE);
+        char b[18]; snprintf(b, sizeof(b), "%.14s", aps[i].ssid);
+        display.setCursor(2, y+1);
+        display.print(b);
+        char rr[10]; snprintf(rr, sizeof(rr), "%d", aps[i].rssi);
+        display.setCursor(80, y+1);
+        display.print(rr);
+        char chn[6]; snprintf(chn, sizeof(chn), "c%d", aps[i].channel);
+        display.setCursor(108, y+1);
+        display.print(chn);
+    }
+    display.setTextColor(WHITE);
+    display.setCursor(2, SCR_H - 8);
+    display.print("S:attack  B:back");
+    display.display();
+}
+
+// ═══ WiFi Attack picker ═══
+const char* AP_ATK[] = {"Deauth","Beacon Spam","Probe Flood"};
+static void sWifiAtkMenu(){
+    const int count = 3, rowH = 12, baseY = 18;
+    smTick(M_WIFI_ATK, g.subSel, 0);
+    display.clearDisplay();
+    display.fillRect(0, 0, SCR_W, 13, WHITE);
+    display.setTextColor(BLACK);
+    display.setTextSize(1);
+    display.setCursor(4, 3);
+    char t[22];
+    snprintf(t, sizeof(t), "Target: %.12s", aps[g.mainSel].ssid);
+    display.print(t);
+
+    float pillY = baseY + smSel * rowH;
+    display.fillRoundRect(0, (int)roundf(pillY), SCR_W, rowH-1, 3, WHITE);
+    for (int idx = 0; idx < count; idx++) {
+        int y = baseY + idx * rowH;
+        bool s = fabsf((float)idx - smSel) < 0.7f;
+        uint16_t c = s ? BLACK : WHITE;
+        display.setTextColor(c);
+        display.fillTriangle(2, y+5, 5, y+2, 5, y+8, c);
+        display.setCursor(12, y+3);
+        display.print(AP_ATK[idx]);
+    }
+    display.setTextColor(WHITE);
+    display.setCursor(2, SCR_H - 8);
+    display.print("S: start  B: back");
+    display.display();
+}
 
 static void sAttackRun(){
     display.clearDisplay(); hdrL("EXEC_ATTACK");
@@ -1563,7 +1681,8 @@ static void drawCurrent(){
         case M_INFO: sInfo(); break;
         case M_WIFI_FILES: sWifiFiles(); break;
         case M_HIDDEN: sHidden(); break;
-        case M_WIFI_TOOLS: sWifiT(); break;
+        case M_WIFI_TOOLS: sWifiApList(); break;
+        case M_WIFI_ATK:   sWifiAtkMenu(); break;
         case M_BT_TOOLS: sBtT(); break;
         case M_IR_MENU: sIrM(); break;
         case M_ATTACK_RUN: sAttackRun(); break;
@@ -1665,21 +1784,40 @@ static void onHidden(int ev){
     if (ev == 0) g.subSel = (g.subSel - 1 + 3) % 3;
     else if (ev == 1) g.subSel = (g.subSel + 1) % 3;
     else if (ev == 2) {
-        if (g.subSel == 0) { g.mode = M_WIFI_TOOLS; g.subSel = 0; }
+        if (g.subSel == 0) {
+            g.mode = M_WIFI_TOOLS;
+            g.subSel = 0;
+            apCount = 0;
+            scanReady = false;
+            startAsyncScan();
+        }
         else if (g.subSel == 1) { g.mode = M_BT_TOOLS; g.subSel = 0; }
         else { g.mode = M_IR_MENU; g.subSel = 0; }
     } else if (ev == 3) g.mode = M_MAIN;
 }
 static void onWifiTools(int ev){
-    if (ev == 0) g.subSel = (g.subSel - 1 + 4) % 4;
-    else if (ev == 1) g.subSel = (g.subSel + 1) % 4;
-    else if (ev == 2) {
-        if (g.subSel == 0) startAsyncScan();
-        else if (g.subSel == 1) { startBeacon(); g.mode = M_ATTACK_RUN; }
-        else if (g.subSel == 2) { if (!apCount) startAsyncScan(); else { startDeauth(0); g.mode = M_ATTACK_RUN; } }
-        else if (g.subSel == 3) { startProbe(); g.mode = M_ATTACK_RUN; }
-    } else if (ev == 3) { g.mode = M_HIDDEN; g.subSel = 0; }
+    if (!scanReady) return;
+    if (ev == 0 && g.subSel > 0) g.subSel--;
+    else if (ev == 1 && g.subSel < apCount - 1) g.subSel++;
+    else if (ev == 2 && apCount > 0) {
+        g.mainSel = g.subSel;
+        g.mode = M_WIFI_ATK;
+        g.subSel = 0;
+    }
+    else if (ev == 3) { g.mode = M_HIDDEN; g.subSel = 0; }
 }
+
+static void onWifiAtk(int ev){
+    if (ev == 0) g.subSel = (g.subSel - 1 + 3) % 3;
+    else if (ev == 1) g.subSel = (g.subSel + 1) % 3;
+    else if (ev == 2) {
+        if (g.subSel == 0) { startDeauth(g.mainSel); g.mode = M_ATTACK_RUN; }
+        else if (g.subSel == 1) { startBeacon(); g.mode = M_ATTACK_RUN; }
+        else if (g.subSel == 2) { startProbe(); g.mode = M_ATTACK_RUN; }
+    }
+    else if (ev == 3) { g.mode = M_WIFI_TOOLS; g.subSel = g.mainSel; }
+}
+
 static void onBtTools(int ev){
     if (ev == 0) g.subSel = (g.subSel - 1 + 3) % 3;
     else if (ev == 1) g.subSel = (g.subSel + 1) % 3;
@@ -1694,7 +1832,13 @@ static void onIrMenu(int ev){
         else g.mode = M_IR_JAM;
     } else if (ev == 3) { g.mode = M_HIDDEN; g.subSel = 2; }
 }
-static void onAttack(int ev){ if (ev == 2 || ev == 3) { stopAttack(); g.mode = M_WIFI_TOOLS; g.subSel = 1; } }
+static void onAttack(int ev){
+    if (ev == 2 || ev == 3) {
+        stopAttack();
+        g.mode = M_WIFI_TOOLS;
+        g.subSel = g.mainSel;
+    }
+}
 static void onGames(int ev){ if (ev == 3) { g.mode = M_MAIN; g.mainSel = 3; } }
 
 static int pollButtons(){
@@ -1768,6 +1912,7 @@ static void uiTask(void*){
                 case M_WIFI_FILES: onWifiFiles(ev); break;
                 case M_HIDDEN: onHidden(ev); break;
                 case M_WIFI_TOOLS: onWifiTools(ev); break;
+                case M_WIFI_ATK:   onWifiAtk(ev); break;
                 case M_BT_TOOLS: onBtTools(ev); break;
                 case M_IR_MENU: onIrMenu(ev); break;
                 case M_ATTACK_RUN: onAttack(ev); break;
@@ -1779,7 +1924,7 @@ static void uiTask(void*){
         }
 
         unsigned long now = millis();
-        if (now - lastDraw > 80) {
+        if (now - lastDraw > 33) {
             lastDraw = now;
             if (!displayOff) { animFrame++; drawCurrent(); }
         }
