@@ -1,7 +1,6 @@
 // ============================================================
 //  SOUMYA Gadget v9.4 — Clean Build
 //  Music + BT + WiFi tools + Smooth UI
-//  No animation player, no games, no IR hardware
 //  BT and WiFi handled separately (DRAM safe)
 // ============================================================
 
@@ -34,7 +33,7 @@ extern "C" {
 
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return 0; }
 
-// ───── Pins ─────
+// ----- Pins -----
 #define OLED_SDA 21
 #define OLED_SCL 22
 #define OLED_ADDR 0x3C
@@ -57,7 +56,7 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t,int32_t,int32_t){ return
 #define RING_SIZE 4096
 #define MAX_SONGS 32
 
-// ───── Enums ─────
+// ----- Enums -----
 enum Mode : uint8_t {
     M_BOOT, M_MAIN, M_SONGS, M_PLAYER,
     M_BT_MENU, M_BT_SCAN,
@@ -91,7 +90,6 @@ String songFiles[MAX_SONGS];
 int songCount = 0;
 static bool a2dpStarted = false;
 
-// Audio ring buffer
 static int16_t ringBuf[RING_SIZE];
 static volatile int rbHead = 0, rbTail = 0;
 static portMUX_TYPE rbMux = portMUX_INITIALIZER_UNLOCKED;
@@ -100,7 +98,6 @@ static volatile float gRMS = 0.0f;
 static volatile bool a2dpConnected = false;
 static volatile bool a2dpStreaming = false;
 
-// BT devices
 struct BtDev { char name[32]; char mac[18]; int rssi; };
 static BtDev btDevs[16];
 static volatile int btDevCount = 0;
@@ -109,14 +106,12 @@ static int btSel = 0;
 static int btConnectTarget = -1;
 static unsigned long btConnectStart = 0;
 
-// WiFi APs
 static APRecord aps[20];
 static int apCount = 0;
 static volatile bool scanInProgress = false;
 static volatile bool scanReady = false;
 static int selectedAP = 0;
 
-// Attack state
 static volatile bool atkRun = false;
 static AttackMode atkMode = ATK_NONE;
 static TaskHandle_t atkTask = nullptr;
@@ -128,7 +123,6 @@ static unsigned long lastActivity = 0;
 static int animFrame = 0;
 static volatile int gSerialEv = -1;
 
-// Smooth UI
 #define SMOOTH_RATE 16.0f
 float smSel = 0, smScroll = 0;
 uint8_t smScene = 255;
@@ -148,7 +142,6 @@ void smTick(uint8_t scene, float ts, float tsc){
     smScene = scene; smLastMs = now;
 }
 
-// ───── Ring buffer ─────
 static void rb_push(int16_t L, int16_t R){
     portENTER_CRITICAL(&rbMux);
     int next = (rbHead + 2) % RING_SIZE;
@@ -240,7 +233,7 @@ static void bt_gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param)
             Serial.printf("[BT] %s [%s] %d dBm\n", nm, bda, rssi);
         }
     } else if (event == ESP_BT_GAP_DISC_STATE_CHANGED_EVT) {
-        if (param->disc_st.chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
+        if (param->disc_st_chg.state == ESP_BT_GAP_DISCOVERY_STOPPED) {
             btScanning = false;
             Serial.println("[BT] Scan complete");
         }
@@ -251,7 +244,6 @@ static AudioFileSource*  audioSrc = nullptr;
 static AudioGeneratorMP3* audioMP3 = nullptr;
 static AudioOutRB*       audioRB  = nullptr;
 
-// ───── Audio ─────
 void loadSongs(){
     songCount = 0;
     File dir = SD.open(MUSIC_DIR, FILE_READ);
@@ -344,7 +336,6 @@ void playSong(int idx){
 void nextSong(){ if (songCount) playSong((g.currentSong + 1) % songCount); }
 void prevSong(){ if (songCount) playSong((g.currentSong - 1 + songCount) % songCount); }
 
-// ───── BT discovery ─────
 static void startBtDiscovery(){
     if (btScanning) return;
     if (!a2dpStarted) ensureBT();
@@ -379,7 +370,6 @@ static void btConnect(int idx){
     esp_a2d_source_connect(bda);
 }
 
-// ───── LED ─────
 static int ledHue = 0;
 static void updateLED(){
     static unsigned long last = 0;
@@ -408,7 +398,6 @@ static void updateLED(){
     FastLED.show();
 }
 
-// ───── Attacks ─────
 static uint8_t deauthFrame[26] = {0xC0,0x00,0x00,0x00,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x07,0x00};
 
 static bool parseMac(const char* s, uint8_t* o){
@@ -534,7 +523,6 @@ static void stopAttack(){
     WiFi.mode(WIFI_OFF);
 }
 
-// ───── WiFi scan ─────
 static void startAsyncScan(){
     if (scanInProgress) return;
     WiFi.mode(WIFI_STA);
@@ -565,7 +553,6 @@ static void pollScan(){
     Serial.printf("[WiFi] Found %d networks\n", apCount);
 }
 
-// ───── Web handlers ─────
 static void hLedRoot(){ ledServer.send_P(200, "text/html", LED_MUSIC_HTML); }
 static void hFileRoot(){ ledServer.send_P(200, "text/html", FILE_MANAGER_HTML); }
 
@@ -679,7 +666,6 @@ static void stopWeb(){
     webRunning = false;
 }
 
-// ───── Display helpers ─────
 static void wakeDisplay(){ lastActivity = millis(); }
 
 static void drawBattery(int x, int y, bool dark){
@@ -719,7 +705,6 @@ static void iMusicL(int x,int y,uint16_t c){display.fillCircle(x+4,y+11,3,c);dis
 static void iBTL(int x,int y,uint16_t c){display.drawFastVLine(x+8,y,16,c);display.drawLine(x+8,y,x+14,y+4,c);display.drawLine(x+14,y+4,x+2,y+11,c);display.drawLine(x+8,y+15,x+14,y+11,c);display.drawLine(x+14,y+11,x+2,y+4,c);}
 static void iLEDL(int x,int y,uint16_t c){display.drawCircle(x+8,y+6,5,c);display.fillRect(x+6,y+12,5,4,c);}
 
-// ───── Screens ─────
 static void sBoot(){
     static int step = 0; static unsigned long lastMs = 0; static int w = 0;
     const char* n = "SOUMYA"; unsigned long now = millis();
@@ -938,7 +923,6 @@ static void sInfo(){
     display.display();
 }
 
-// ───── Hidden menu (card stack) ─────
 const char* HID_M[] = {"WiFi Tools","BT Tools","IR Remote"};
 const char* IR_M[] = {"Learn Code","Transmit Code","IR Jammer"};
 
@@ -976,7 +960,6 @@ static void drawCardMenu(uint8_t sceneID, int sel, const char* title, const char
 static void sHidden(){ drawCardMenu(M_HIDDEN, g.subSel, "ADMIN", HID_M, 3); }
 static void sIrMenu(){ drawCardMenu(M_IR_MENU, g.subSel, "IR REMOTE", IR_M, 3); }
 
-// ───── WiFi AP list ─────
 static void sWifiApList(){
     display.clearDisplay();
     display.fillRect(0, 0, SCR_W, 13, WHITE);
@@ -1035,7 +1018,6 @@ static void sWifiApList(){
     display.display();
 }
 
-// ───── Attack menu ─────
 const char* AP_ATK[] = {"Deauth", "Beacon Spam", "Probe Flood"};
 static void sWifiAtkMenu(){
     const int count = 3, rowH = 12, baseY = 16;
@@ -1121,7 +1103,6 @@ static void sIrJam(){
     display.display();
 }
 
-// ───── Router ─────
 static void drawCurrent(){
     switch (g.mode) {
         case M_BOOT: sBoot(); break;
@@ -1145,7 +1126,6 @@ static void drawCurrent(){
     }
 }
 
-// ───── Handlers ─────
 static void onMain(int ev){
     if (ev == 0) g.mainSel = (g.mainSel - 1 + 6) % 6;
     else if (ev == 1) g.mainSel = (g.mainSel + 1) % 6;
@@ -1187,7 +1167,6 @@ static void onBtMenu(int ev){
             btConnectTarget = -1;
             startBtDiscovery();
         } else if (g.subSel == 1) {
-            // connect to first found
             if (btDevCount > 0) btConnect(0);
         } else {
             g.mode = M_MAIN; g.mainSel = 2;
@@ -1288,7 +1267,6 @@ static void uiTask(void*){
 
         pollScan();
 
-        // LED update
         if (g.mode == M_LED_MENU || g.mode == M_MAIN ||
             g.mode == M_PLAYER || g.mode == M_ATTACK_RUN) updateLED();
 
@@ -1314,7 +1292,7 @@ static void uiTask(void*){
         }
 
         unsigned long now = millis();
-        if (now - lastDraw > 33) {     // 30 FPS target
+        if (now - lastDraw > 33) {
             lastDraw = now;
             animFrame++;
             drawCurrent();
@@ -1332,7 +1310,6 @@ static void audioTask(void*){
     }
 }
 
-// ───── Setup ─────
 void setup(){
     Serial.begin(115200);
     delay(500);
