@@ -1,4 +1,4 @@
-//  ESPocket v8.1 — Full build (forward declarations added)
+//  ESPocket v8.2 — Deauth bypass (raw frame sanity check override)
 // ============================================================
 
 #include <Wire.h>
@@ -13,6 +13,14 @@
 #include <IRsend.h>
 #include <IRrecv.h>
 #include <IRutils.h>
+
+// ============================================================
+//  Deauth bypass — override ESP-IDF sanity check
+//  (requires -Wl,-zmuldefs in platformio.ini build_flags)
+// ============================================================
+extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
+  return 0;   // always allow — required for deauth frame injection
+}
 
 #define OLED_SDA     21
 #define OLED_SCL     22
@@ -762,7 +770,7 @@ void dAbout() {
   hdrL("ABOUT");
   display.setTextSize(1); display.setTextColor(WHITE);
   lastTempC = readTempC();
-  display.setCursor(4, 16); display.print("ESPocket v8.1");
+  display.setCursor(4, 16); display.print("ESPocket v8.2");
   display.setCursor(4, 26); display.print("ESP32-WROOM-32");
   display.setCursor(4, 36); display.print("Temp: "); display.print(lastTempC, 1); display.print(" C");
   unsigned long up=(millis()-bootMs)/1000UL;
@@ -1391,7 +1399,7 @@ void checkOverheat(){
 // ============================================================
 void setup(){
   Serial.begin(115200);delay(300);
-  Serial.println("\n[BOOT] ESPocket v8.1");
+  Serial.println("\n[BOOT] ESPocket v8.2");
 
   Wire.begin(OLED_SDA,OLED_SCL);
   Wire.setClock(400000);
