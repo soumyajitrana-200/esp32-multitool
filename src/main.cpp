@@ -1,5 +1,4 @@
-// ============================================================
-//  ESPocket v8.0 — Full build (Deauth-enabled, core 2.0.9)
+//  ESPocket v8.1 — Full build (forward declarations added)
 // ============================================================
 
 #include <Wire.h>
@@ -54,6 +53,11 @@ enum Scene : uint8_t {
   S_IR_LEARN, S_IR_LIST, S_IR_TX, S_IR_JAM, S_IR_TVBG,
   S_DEAUTH
 };
+
+// ---------- Forward declarations (PlatformIO strict C++) ----------
+void goToScene(Scene s);
+bool touched(int pin, int baseline);
+
 Scene currentScene = S_MAIN;
 unsigned long sceneStartMs = 0;
 unsigned long bootMs = 0;
@@ -758,7 +762,7 @@ void dAbout() {
   hdrL("ABOUT");
   display.setTextSize(1); display.setTextColor(WHITE);
   lastTempC = readTempC();
-  display.setCursor(4, 16); display.print("ESPocket v8.0");
+  display.setCursor(4, 16); display.print("ESPocket v8.1");
   display.setCursor(4, 26); display.print("ESP32-WROOM-32");
   display.setCursor(4, 36); display.print("Temp: "); display.print(lastTempC, 1); display.print(" C");
   unsigned long up=(millis()-bootMs)/1000UL;
@@ -847,7 +851,6 @@ void dWifiScan() {
   }
 
   if (!wifiScanDone) {
-    unsigned long elapsed = millis() - sceneStartMs;
     int n = WiFi.scanComplete();
 
     display.clearDisplay();
@@ -1388,7 +1391,7 @@ void checkOverheat(){
 // ============================================================
 void setup(){
   Serial.begin(115200);delay(300);
-  Serial.println("\n[BOOT] ESPocket v8.0");
+  Serial.println("\n[BOOT] ESPocket v8.1");
 
   Wire.begin(OLED_SDA,OLED_SCL);
   Wire.setClock(400000);
