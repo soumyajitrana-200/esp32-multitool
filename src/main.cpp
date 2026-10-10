@@ -1,6 +1,5 @@
 // ============================================================
-//  ESPocket v9.0 — Final build
-//  WiFi + BT + IR + BLE + Battery + Games + Hidden Menu
+//  ESPocket v9.1 — PlatformIO BLE std::string fix
 // ============================================================
 
 #include <Wire.h>
@@ -19,7 +18,7 @@
 #include <IRrecv.h>
 #include <IRutils.h>
 
-// ---------- Deauth bypass (active on PlatformIO with -Wl,-zmuldefs) ----------
+// ---------- Deauth bypass ----------
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
   return 0;
 }
@@ -671,7 +670,7 @@ void bleStartScan() {
 void bleSendApplePopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
-  String mfg;
+  std::string mfg;                        // FIX 1
   mfg += (char)0x4C; mfg += (char)0x00;
   mfg += (char)0x07; mfg += (char)0x19; mfg += (char)0x01;
   mfg += (char)random(0, 256); mfg += (char)random(0, 256);
@@ -687,7 +686,7 @@ void bleSendApplePopup() {
 void bleSendSamsungPopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
-  String mfg;
+  std::string mfg;                        // FIX 2
   mfg += (char)0x75; mfg += (char)0x00;
   mfg += (char)0x01; mfg += (char)0x00;
   mfg += (char)random(0, 256); mfg += (char)random(0, 256);
@@ -701,7 +700,7 @@ void bleSendSamsungPopup() {
 void bleSendMicrosoftPopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
-  String mfg;
+  std::string mfg;                        // FIX 3
   mfg += (char)0x06; mfg += (char)0x00;
   mfg += (char)0x03; mfg += (char)0x00;
   mfg += (char)0x80;
@@ -752,7 +751,7 @@ void bleStartIBeacon() {
 
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
-  String mfg;
+  std::string mfg;                        // FIX 4
   mfg += (char)0x4C; mfg += (char)0x00;
   mfg += (char)0x02; mfg += (char)0x15;
   const uint8_t uuid[16] = {
@@ -1170,7 +1169,7 @@ void dAbout() {
   hdrL("ABOUT");
   display.setTextSize(1); display.setTextColor(WHITE);
   lastTempC = readTempC();
-  display.setCursor(4, 16); display.print("ESPocket v9.0");
+  display.setCursor(4, 16); display.print("ESPocket v9.1");
   display.setCursor(4, 26); display.print("ESP32-WROOM-32");
   display.setCursor(4, 36); display.print("Temp: "); display.print(lastTempC, 1); display.print(" C");
   unsigned long up=(millis()-bootMs)/1000UL;
@@ -2000,7 +1999,7 @@ void checkOverheat(){
 // ============================================================
 void setup(){
   Serial.begin(115200);delay(300);
-  Serial.println("\n[BOOT] ESPocket v9.0");
+  Serial.println("\n[BOOT] ESPocket v9.1");
 
   Wire.begin(OLED_SDA,OLED_SCL);
   Wire.setClock(400000);
