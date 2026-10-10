@@ -1,5 +1,5 @@
 // ============================================================
-//  ESPocket v9.1 — PlatformIO BLE std::string fix
+//  ESPocket v9.2 — getNative() dereference fix
 // ============================================================
 
 #include <Wire.h>
@@ -632,7 +632,7 @@ class BLEAdvertisedCallbacks : public BLEAdvertisedDeviceCallbacks {
     strncpy(bleDevs[bleDevCount].name, name.c_str(), 23);
     bleDevs[bleDevCount].name[23] = 0;
     BLEAddress addr = dev.getAddress();
-    uint8_t* a = addr.getNative();
+    uint8_t* a = *addr.getNative();   // FIX: dereference array pointer
     for (int i = 0; i < 6; i++) bleDevs[bleDevCount].addr[i] = a[i];
     bleDevs[bleDevCount].rssi = dev.getRSSI();
     bleDevCount++;
@@ -670,7 +670,7 @@ void bleStartScan() {
 void bleSendApplePopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
-  std::string mfg;                        // FIX 1
+  std::string mfg;
   mfg += (char)0x4C; mfg += (char)0x00;
   mfg += (char)0x07; mfg += (char)0x19; mfg += (char)0x01;
   mfg += (char)random(0, 256); mfg += (char)random(0, 256);
@@ -686,7 +686,7 @@ void bleSendApplePopup() {
 void bleSendSamsungPopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
-  std::string mfg;                        // FIX 2
+  std::string mfg;
   mfg += (char)0x75; mfg += (char)0x00;
   mfg += (char)0x01; mfg += (char)0x00;
   mfg += (char)random(0, 256); mfg += (char)random(0, 256);
@@ -700,7 +700,7 @@ void bleSendSamsungPopup() {
 void bleSendMicrosoftPopup() {
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
-  std::string mfg;                        // FIX 3
+  std::string mfg;
   mfg += (char)0x06; mfg += (char)0x00;
   mfg += (char)0x03; mfg += (char)0x00;
   mfg += (char)0x80;
@@ -751,7 +751,7 @@ void bleStartIBeacon() {
 
   BLEAdvertisementData advData;
   advData.setFlags(0x06);
-  std::string mfg;                        // FIX 4
+  std::string mfg;
   mfg += (char)0x4C; mfg += (char)0x00;
   mfg += (char)0x02; mfg += (char)0x15;
   const uint8_t uuid[16] = {
@@ -1169,7 +1169,7 @@ void dAbout() {
   hdrL("ABOUT");
   display.setTextSize(1); display.setTextColor(WHITE);
   lastTempC = readTempC();
-  display.setCursor(4, 16); display.print("ESPocket v9.1");
+  display.setCursor(4, 16); display.print("ESPocket v9.2");
   display.setCursor(4, 26); display.print("ESP32-WROOM-32");
   display.setCursor(4, 36); display.print("Temp: "); display.print(lastTempC, 1); display.print(" C");
   unsigned long up=(millis()-bootMs)/1000UL;
@@ -1999,7 +1999,7 @@ void checkOverheat(){
 // ============================================================
 void setup(){
   Serial.begin(115200);delay(300);
-  Serial.println("\n[BOOT] ESPocket v9.1");
+  Serial.println("\n[BOOT] ESPocket v9.2");
 
   Wire.begin(OLED_SDA,OLED_SCL);
   Wire.setClock(400000);
